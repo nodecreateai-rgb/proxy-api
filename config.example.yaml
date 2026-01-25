@@ -270,3 +270,12 @@ oauth-model-mappings:
 #           protocol: "codex" # restricts the rule to a specific protocol, options: openai, gemini, claude, codex
 #       params: # JSON path (gjson/sjson syntax) -> value
 #         "reasoning.effort": "high"
+
+payload:
+    override:
+        - models:
+              - name: "gemini-3-pro-image-preview"
+                protocol: "antigravity"
+          params:
+              "generationConfig.imageConfig.imageSize": "4K"
+              "generationConfig.thinkingConfig.includeThoughts": false
