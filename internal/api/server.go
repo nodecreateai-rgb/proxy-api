@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,6 +27,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
@@ -254,15 +256,13 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	managementasset.SetCurrentConfig(cfg)
 	auth.SetQuotaCooldownDisabled(cfg.DisableCooling)
+	misc.SetCodexInstructionsEnabled(cfg.CodexInstructionsEnabled)
 	// Initialize management handler
 	s.mgmt = managementHandlers.NewHandler(cfg, configFilePath, authManager)
 	if optionState.localPassword != "" {
 		s.mgmt.SetLocalPassword(optionState.localPassword)
 	}
-	logDir := filepath.Join(s.currentPath, "logs")
-	if base := util.WritablePath(); base != "" {
-		logDir = filepath.Join(base, "logs")
-	}
+	logDir := logging.ResolveLogDirectory(cfg)
 	s.mgmt.SetLogDirectory(logDir)
 	s.localPassword = optionState.localPassword
 
@@ -326,6 +326,7 @@ func (s *Server) setupRoutes() {
 		v1.POST("/messages", claudeCodeHandlers.ClaudeMessages)
 		v1.POST("/messages/count_tokens", claudeCodeHandlers.ClaudeCountTokens)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
+		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
 	}
 
 	// Gemini compatible API routes
@@ -601,16 +602,18 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.PATCH("/oauth-excluded-models", s.mgmt.PatchOAuthExcludedModels)
 		mgmt.DELETE("/oauth-excluded-models", s.mgmt.DeleteOAuthExcludedModels)
 
-		mgmt.GET("/oauth-model-mappings", s.mgmt.GetOAuthModelMappings)
-		mgmt.PUT("/oauth-model-mappings", s.mgmt.PutOAuthModelMappings)
-		mgmt.PATCH("/oauth-model-mappings", s.mgmt.PatchOAuthModelMappings)
-		mgmt.DELETE("/oauth-model-mappings", s.mgmt.DeleteOAuthModelMappings)
+		mgmt.GET("/oauth-model-alias", s.mgmt.GetOAuthModelAlias)
+		mgmt.PUT("/oauth-model-alias", s.mgmt.PutOAuthModelAlias)
+		mgmt.PATCH("/oauth-model-alias", s.mgmt.PatchOAuthModelAlias)
+		mgmt.DELETE("/oauth-model-alias", s.mgmt.DeleteOAuthModelAlias)
 
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
+		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
 		mgmt.POST("/auth-files", s.mgmt.UploadAuthFile)
 		mgmt.DELETE("/auth-files", s.mgmt.DeleteAuthFile)
+		mgmt.PATCH("/auth-files/status", s.mgmt.PatchAuthFileStatus)
 		mgmt.POST("/vertex/import", s.mgmt.ImportVertexCredential)
 
 		mgmt.GET("/anthropic-auth-url", s.mgmt.RequestAnthropicToken)
@@ -912,6 +915,16 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 			log.Debugf("disable_cooling toggled to %t", cfg.DisableCooling)
 		}
 	}
+
+	if oldCfg == nil || oldCfg.CodexInstructionsEnabled != cfg.CodexInstructionsEnabled {
+		misc.SetCodexInstructionsEnabled(cfg.CodexInstructionsEnabled)
+		if oldCfg != nil {
+			log.Debugf("codex_instructions_enabled updated from %t to %t", oldCfg.CodexInstructionsEnabled, cfg.CodexInstructionsEnabled)
+		} else {
+			log.Debugf("codex_instructions_enabled toggled to %t", cfg.CodexInstructionsEnabled)
+		}
+	}
+
 	if s.handlers != nil && s.handlers.AuthManager != nil {
 		s.handlers.AuthManager.SetRetryConfig(cfg.RequestRetry, time.Duration(cfg.MaxRetryInterval)*time.Second)
 	}
@@ -979,14 +992,17 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		s.mgmt.SetAuthManager(s.handlers.AuthManager)
 	}
 
-	// Notify Amp module of config changes (for model mapping hot-reload)
-	if s.ampModule != nil {
-		log.Debugf("triggering amp module config update")
-		if err := s.ampModule.OnConfigUpdated(cfg); err != nil {
-			log.Errorf("failed to update Amp module config: %v", err)
+	// Notify Amp module only when Amp config has changed.
+	ampConfigChanged := oldCfg == nil || !reflect.DeepEqual(oldCfg.AmpCode, cfg.AmpCode)
+	if ampConfigChanged {
+		if s.ampModule != nil {
+			log.Debugf("triggering amp module config update")
+			if err := s.ampModule.OnConfigUpdated(cfg); err != nil {
+				log.Errorf("failed to update Amp module config: %v", err)
+			}
+		} else {
+			log.Warnf("amp module is nil, skipping config update")
 		}
-	} else {
-		log.Warnf("amp module is nil, skipping config update")
 	}
 
 	// Count client sources from configuration and auth store.
