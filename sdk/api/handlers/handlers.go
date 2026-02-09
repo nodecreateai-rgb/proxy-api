@@ -155,20 +155,6 @@ func requestExecutionMetadata(ctx context.Context) map[string]any {
 	return map[string]any{idempotencyKeyMetadataKey: key}
 }
 
-func mergeMetadata(base, overlay map[string]any) map[string]any {
-	if len(base) == 0 && len(overlay) == 0 {
-		return nil
-	}
-	out := make(map[string]any, len(base)+len(overlay))
-	for k, v := range base {
-		out[k] = v
-	}
-	for k, v := range overlay {
-		out[k] = v
-	}
-	return out
-}
-
 // BaseAPIHandler contains the handlers for API endpoints.
 // It holds a pool of clients to interact with the backend service and manages
 // load balancing, client selection, and configuration.
@@ -391,14 +377,18 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	payload := rawJSON
+	if len(payload) == 0 {
+		payload = nil
+	}
 	req := coreexecutor.Request{
 		Model:   normalizedModel,
-		Payload: cloneBytes(rawJSON),
+		Payload: payload,
 	}
 	opts := coreexecutor.Options{
 		Stream:          false,
 		Alt:             alt,
-		OriginalRequest: cloneBytes(rawJSON),
+		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
 	opts.Metadata = reqMeta
@@ -418,7 +408,7 @@ func (h *BaseAPIHandler) ExecuteWithAuthManager(ctx context.Context, handlerType
 		}
 		return nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
-	return cloneBytes(resp.Payload), nil
+	return resp.Payload, nil
 }
 
 // ExecuteCountWithAuthManager executes a non-streaming request via the core auth manager.
@@ -430,14 +420,18 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	payload := rawJSON
+	if len(payload) == 0 {
+		payload = nil
+	}
 	req := coreexecutor.Request{
 		Model:   normalizedModel,
-		Payload: cloneBytes(rawJSON),
+		Payload: payload,
 	}
 	opts := coreexecutor.Options{
 		Stream:          false,
 		Alt:             alt,
-		OriginalRequest: cloneBytes(rawJSON),
+		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
 	opts.Metadata = reqMeta
@@ -457,7 +451,7 @@ func (h *BaseAPIHandler) ExecuteCountWithAuthManager(ctx context.Context, handle
 		}
 		return nil, &interfaces.ErrorMessage{StatusCode: status, Error: err, Addon: addon}
 	}
-	return cloneBytes(resp.Payload), nil
+	return resp.Payload, nil
 }
 
 // ExecuteStreamWithAuthManager executes a streaming request via the core auth manager.
@@ -472,14 +466,18 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 	}
 	reqMeta := requestExecutionMetadata(ctx)
 	reqMeta[coreexecutor.RequestedModelMetadataKey] = normalizedModel
+	payload := rawJSON
+	if len(payload) == 0 {
+		payload = nil
+	}
 	req := coreexecutor.Request{
 		Model:   normalizedModel,
-		Payload: cloneBytes(rawJSON),
+		Payload: payload,
 	}
 	opts := coreexecutor.Options{
 		Stream:          true,
 		Alt:             alt,
-		OriginalRequest: cloneBytes(rawJSON),
+		OriginalRequest: rawJSON,
 		SourceFormat:    sdktranslator.FromString(handlerType),
 	}
 	opts.Metadata = reqMeta
@@ -668,17 +666,6 @@ func cloneBytes(src []byte) []byte {
 	return dst
 }
 
-func cloneMetadata(src map[string]any) map[string]any {
-	if len(src) == 0 {
-		return nil
-	}
-	dst := make(map[string]any, len(src))
-	for k, v := range src {
-		dst[k] = v
-	}
-	return dst
-}
-
 // WriteErrorResponse writes an error message to the response writer using the HTTP status embedded in the message.
 func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.ErrorMessage) {
 	status := http.StatusInternalServerError
@@ -709,7 +696,7 @@ func (h *BaseAPIHandler) WriteErrorResponse(c *gin.Context, msg *interfaces.Erro
 	var previous []byte
 	if existing, exists := c.Get("API_RESPONSE"); exists {
 		if existingBytes, ok := existing.([]byte); ok && len(existingBytes) > 0 {
-			previous = bytes.Clone(existingBytes)
+			previous = existingBytes
 		}
 	}
 	appendAPIResponse(c, body)

@@ -38,6 +38,11 @@ api-keys:
 # Enable debug logging
 debug: false
 
+# Enable pprof HTTP debug server (host:port). Keep it bound to localhost for safety.
+pprof:
+    enable: false
+    addr: "127.0.0.1:8316"
+
 # When true, disable high-overhead HTTP middleware features to reduce per-request memory usage under high concurrency.
 commercial-mode: true
 
@@ -78,14 +83,6 @@ routing:
 
 # When true, enable authentication for the WebSocket API (/v1/ws).
 ws-auth: false
-oauth-model-mappings:
-    antigravity:
-        - name: gemini-claude-opus-4-5-thinking
-          alias: claude-opus-4-5-thinking
-        - name: gemini-claude-sonnet-4-5-thinking
-          alias: claude-sonnet-4-5-thinking
-        - name: gemini-claude-sonnet-4-5
-          alias: claude-sonnet-4-5
 # Streaming behavior (SSE keep-alives + safe bootstrap retries).
 # streaming:
 #   keepalive-seconds: 15   # Default: 0 (disabled). <= 0 disables keep-alives.
@@ -207,11 +204,27 @@ oauth-model-mappings:
 #     - from: "claude-haiku-4-5-20251001"
 #       to: "gemini-2.5-flash"
 
-# Global OAuth model name mappings (per channel)
-# These mappings rename model IDs for both model listing and request routing.
-# Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow.
-# NOTE: Mappings do not apply to gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, or ampcode.
-# oauth-model-mappings:
+# Global OAuth model name aliases (per channel)
+# These aliases rename model IDs for both model listing and request routing.
+# Supported channels: gemini-cli, vertex, aistudio, antigravity, claude, codex, qwen, iflow, kimi.
+# NOTE: Aliases do not apply to gemini-api-key, codex-api-key, claude-api-key, openai-compatibility, vertex-api-key, or ampcode.
+# You can repeat the same name with different aliases to expose multiple client model names.
+oauth-model-alias:
+    antigravity:
+        - name: "rev19-uic3-1p"
+          alias: "gemini-2.5-computer-use-preview-10-2025"
+        - name: "gemini-3-pro-image"
+          alias: "gemini-3-pro-image-preview"
+        - name: "gemini-3-pro-high"
+          alias: "gemini-3-pro-preview"
+        - name: "gemini-3-flash"
+          alias: "gemini-3-flash-preview"
+        - name: "claude-sonnet-4-5"
+          alias: "gemini-claude-sonnet-4-5"
+        - name: "claude-sonnet-4-5-thinking"
+          alias: "gemini-claude-sonnet-4-5-thinking"
+        - name: "claude-opus-4-5-thinking"
+          alias: "gemini-claude-opus-4-5-thinking"
 #   gemini-cli:
 #     - name: "gemini-2.5-pro"          # original model name under this channel
 #       alias: "g2.5p"                  # client-visible alias
@@ -237,6 +250,9 @@ oauth-model-mappings:
 #   iflow:
 #     - name: "glm-4.7"
 #       alias: "glm-god"
+#   kimi:
+#     - name: "kimi-k2.5"
+#       alias: "k2.5"
 
 # OAuth provider excluded models
 # oauth-excluded-models:
@@ -259,6 +275,8 @@ oauth-model-mappings:
 #     - "vision-model"
 #   iflow:
 #     - "tstars2.0"
+#   kimi:
+#     - "kimi-k2-thinking"
 
 # Optional payload configuration
 # payload:

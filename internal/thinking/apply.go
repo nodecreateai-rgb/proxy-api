@@ -18,6 +18,7 @@ var providerAppliers = map[string]ProviderApplier{
 	"codex":       nil,
 	"iflow":       nil,
 	"antigravity": nil,
+	"kimi":        nil,
 }
 
 // GetProviderApplier returns the ProviderApplier for the given provider name.
@@ -326,6 +327,9 @@ func extractThinkingConfig(body []byte, provider string) ThinkingConfig {
 			return config
 		}
 		return extractOpenAIConfig(body)
+	case "kimi":
+		// Kimi uses OpenAI-compatible reasoning_effort format
+		return extractOpenAIConfig(body)
 	default:
 		return ThinkingConfig{}
 	}
@@ -388,7 +392,12 @@ func extractGeminiConfig(body []byte, provider string) ThinkingConfig {
 	}
 
 	// Check thinkingLevel first (Gemini 3 format takes precedence)
-	if level := gjson.GetBytes(body, prefix+".thinkingLevel"); level.Exists() {
+	level := gjson.GetBytes(body, prefix+".thinkingLevel")
+	if !level.Exists() {
+		// Google official Gemini Python SDK sends snake_case field names
+		level = gjson.GetBytes(body, prefix+".thinking_level")
+	}
+	if level.Exists() {
 		value := level.String()
 		switch value {
 		case "none":
@@ -401,7 +410,12 @@ func extractGeminiConfig(body []byte, provider string) ThinkingConfig {
 	}
 
 	// Check thinkingBudget (Gemini 2.5 format)
-	if budget := gjson.GetBytes(body, prefix+".thinkingBudget"); budget.Exists() {
+	budget := gjson.GetBytes(body, prefix+".thinkingBudget")
+	if !budget.Exists() {
+		// Google official Gemini Python SDK sends snake_case field names
+		budget = gjson.GetBytes(body, prefix+".thinking_budget")
+	}
+	if budget.Exists() {
 		value := int(budget.Int())
 		switch value {
 		case 0:

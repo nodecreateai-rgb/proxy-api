@@ -27,6 +27,11 @@ import (
 	"github.com/google/uuid"
 )
 
+const (
+	codexClientVersion = "0.98.0"
+	codexUserAgent     = "codex_cli_rs/0.98.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+)
+
 var dataTag = []byte("data:")
 
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
@@ -88,16 +93,13 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	userAgent := codexUserAgent(ctx)
-	originalPayload := bytes.Clone(req.Payload)
+	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
-		originalPayload = bytes.Clone(opts.OriginalRequest)
+		originalPayloadSource = opts.OriginalRequest
 	}
-	originalPayload = misc.InjectCodexUserAgent(originalPayload, userAgent)
+	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := misc.InjectCodexUserAgent(bytes.Clone(req.Payload), userAgent)
-	body = sdktranslator.TranslateRequest(from, to, baseModel, body, false)
-	body = misc.StripCodexUserAgent(body)
+	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -180,7 +182,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		}
 
 		var param any
-		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(originalPayload), body, line, &param)
+		out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, line, &param)
 		resp = cliproxyexecutor.Response{Payload: []byte(out)}
 		return resp, nil
 	}
@@ -201,12 +203,13 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai-response")
-	originalPayload := bytes.Clone(req.Payload)
+	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
-		originalPayload = bytes.Clone(opts.OriginalRequest)
+		originalPayloadSource = opts.OriginalRequest
 	}
+	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, false)
-	body := sdktranslator.TranslateRequest(from, to, baseModel, bytes.Clone(req.Payload), false)
+	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -269,7 +272,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 	reporter.publish(ctx, parseOpenAIUsage(data))
 	reporter.ensurePublished(ctx)
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, bytes.Clone(originalPayload), body, data, &param)
+	out := sdktranslator.TranslateNonStream(ctx, to, from, req.Model, originalPayload, body, data, &param)
 	resp = cliproxyexecutor.Response{Payload: []byte(out)}
 	return resp, nil
 }
@@ -290,16 +293,13 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	userAgent := codexUserAgent(ctx)
-	originalPayload := bytes.Clone(req.Payload)
+	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
-		originalPayload = bytes.Clone(opts.OriginalRequest)
+		originalPayloadSource = opts.OriginalRequest
 	}
-	originalPayload = misc.InjectCodexUserAgent(originalPayload, userAgent)
+	originalPayload := originalPayloadSource
 	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, true)
-	body := misc.InjectCodexUserAgent(bytes.Clone(req.Payload), userAgent)
-	body = sdktranslator.TranslateRequest(from, to, baseModel, body, true)
-	body = misc.StripCodexUserAgent(body)
+	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, true)
 
 	body, err = thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -386,7 +386,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 				}
 			}
 
-			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, bytes.Clone(originalPayload), body, bytes.Clone(line), &param)
+			chunks := sdktranslator.TranslateStream(ctx, to, from, req.Model, originalPayload, body, bytes.Clone(line), &param)
 			for i := range chunks {
 				out <- cliproxyexecutor.StreamChunk{Payload: []byte(chunks[i])}
 			}
@@ -405,10 +405,7 @@ func (e *CodexExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("codex")
-	userAgent := codexUserAgent(ctx)
-	body := misc.InjectCodexUserAgent(bytes.Clone(req.Payload), userAgent)
-	body = sdktranslator.TranslateRequest(from, to, baseModel, body, false)
-	body = misc.StripCodexUserAgent(body)
+	body := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, false)
 
 	body, err := thinking.ApplyThinking(body, req.Model, from.String(), to.String(), e.Identifier())
 	if err != nil {
@@ -645,10 +642,10 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		ginHeaders = ginCtx.Request.Header
 	}
 
-	misc.EnsureHeader(r.Header, ginHeaders, "Version", "0.21.0")
+	misc.EnsureHeader(r.Header, ginHeaders, "Version", codexClientVersion)
 	misc.EnsureHeader(r.Header, ginHeaders, "Openai-Beta", "responses=experimental")
 	misc.EnsureHeader(r.Header, ginHeaders, "Session_id", uuid.NewString())
-	misc.EnsureHeader(r.Header, ginHeaders, "User-Agent", "codex_cli_rs/0.50.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464")
+	misc.EnsureHeader(r.Header, ginHeaders, "User-Agent", codexUserAgent)
 
 	if stream {
 		r.Header.Set("Accept", "text/event-stream")
@@ -676,16 +673,6 @@ func applyCodexHeaders(r *http.Request, auth *cliproxyauth.Auth, token string, s
 		attrs = auth.Attributes
 	}
 	util.ApplyCustomHeadersFromAttrs(r, attrs)
-}
-
-func codexUserAgent(ctx context.Context) string {
-	if ctx == nil {
-		return ""
-	}
-	if ginCtx, ok := ctx.Value("gin").(*gin.Context); ok && ginCtx != nil && ginCtx.Request != nil {
-		return strings.TrimSpace(ginCtx.Request.UserAgent())
-	}
-	return ""
 }
 
 func codexCreds(a *cliproxyauth.Auth) (apiKey, baseURL string) {
