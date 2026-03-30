@@ -339,12 +339,13 @@ func (h *BaseAPIHandler) GetContextWithCancel(handler interfaces.APIHandler, c *
 		}
 	}
 	newCtx, cancel := context.WithCancel(parentCtx)
+	cancelCtx := newCtx
 	if requestCtx != nil && requestCtx != parentCtx {
 		go func() {
 			select {
 			case <-requestCtx.Done():
 				cancel()
-			case <-newCtx.Done():
+			case <-cancelCtx.Done():
 			}
 		}()
 	}
@@ -716,6 +717,12 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 					return
 				}
 				if len(chunk.Payload) > 0 {
+					if handlerType == "openai-response" {
+						if err := validateSSEDataJSON(chunk.Payload); err != nil {
+							_ = sendErr(&interfaces.ErrorMessage{StatusCode: http.StatusBadGateway, Error: err})
+							return
+						}
+					}
 					sentPayload = true
 					if okSendData := sendData(cloneBytes(chunk.Payload)); !okSendData {
 						return
@@ -725,6 +732,35 @@ func (h *BaseAPIHandler) ExecuteStreamWithAuthManager(ctx context.Context, handl
 		}
 	}()
 	return dataChan, upstreamHeaders, errChan
+}
+
+func validateSSEDataJSON(chunk []byte) error {
+	for _, line := range bytes.Split(chunk, []byte("\n")) {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 {
+			continue
+		}
+		if !bytes.HasPrefix(line, []byte("data:")) {
+			continue
+		}
+		data := bytes.TrimSpace(line[5:])
+		if len(data) == 0 {
+			continue
+		}
+		if bytes.Equal(data, []byte("[DONE]")) {
+			continue
+		}
+		if json.Valid(data) {
+			continue
+		}
+		const max = 512
+		preview := data
+		if len(preview) > max {
+			preview = preview[:max]
+		}
+		return fmt.Errorf("invalid SSE data JSON (len=%d): %q", len(data), preview)
+	}
+	return nil
 }
 
 func statusFromError(err error) int {
