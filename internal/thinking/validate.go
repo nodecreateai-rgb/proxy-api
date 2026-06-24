@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -339,7 +339,7 @@ func normalizeLevels(levels []string) []string {
 // These providers may also support level-based thinking (hybrid models).
 func isBudgetCapableProvider(provider string) bool {
 	switch provider {
-	case "gemini", "gemini-cli", "antigravity", "claude":
+	case "gemini", "antigravity", "claude":
 		return true
 	default:
 		return false
@@ -348,7 +348,7 @@ func isBudgetCapableProvider(provider string) bool {
 
 func isGeminiFamily(provider string) bool {
 	switch provider {
-	case "gemini", "gemini-cli", "antigravity":
+	case "gemini", "antigravity":
 		return true
 	default:
 		return false

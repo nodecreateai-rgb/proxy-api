@@ -5,8 +5,9 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/diff"
-	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 )
 
 // ConfigSynthesizer generates Auth entries from configuration API keys.
@@ -60,6 +61,10 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 			"source":  fmt.Sprintf("config:gemini[%s]", token),
 			"api_key": key,
 		}
+		metadata := map[string]any{}
+		if entry.DisableCooling {
+			metadata["disable_cooling"] = true
+		}
 		if entry.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(entry.Priority)
 		}
@@ -78,10 +83,14 @@ func (s *ConfigSynthesizer) synthesizeGeminiKeys(ctx *SynthesisContext) []*corea
 			Status:     coreauth.StatusActive,
 			ProxyURL:   proxyURL,
 			Attributes: attrs,
+			Metadata:   metadata,
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, entry.ExcludedModels, "apikey")
+		if len(a.Metadata) == 0 {
+			a.Metadata = nil
+		}
 		out = append(out, a)
 	}
 	return out
@@ -107,11 +116,18 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			"source":  fmt.Sprintf("config:claude[%s]", token),
 			"api_key": key,
 		}
+		metadata := map[string]any{}
+		if ck.DisableCooling {
+			metadata["disable_cooling"] = true
+		}
 		if ck.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(ck.Priority)
 		}
 		if base != "" {
 			attrs["base_url"] = base
+		}
+		if ck.RebuildMidSystemMessage {
+			attrs["rebuild_mid_system_message"] = "true"
 		}
 		if hash := diff.ComputeClaudeModelsHash(ck.Models); hash != "" {
 			attrs["models_hash"] = hash
@@ -126,10 +142,14 @@ func (s *ConfigSynthesizer) synthesizeClaudeKeys(ctx *SynthesisContext) []*corea
 			Status:     coreauth.StatusActive,
 			ProxyURL:   proxyURL,
 			Attributes: attrs,
+			Metadata:   metadata,
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
+		if len(a.Metadata) == 0 {
+			a.Metadata = nil
+		}
 		out = append(out, a)
 	}
 	return out
@@ -154,6 +174,10 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 			"source":  fmt.Sprintf("config:codex[%s]", token),
 			"api_key": key,
 		}
+		metadata := map[string]any{}
+		if ck.DisableCooling {
+			metadata["disable_cooling"] = true
+		}
 		if ck.Priority != 0 {
 			attrs["priority"] = strconv.Itoa(ck.Priority)
 		}
@@ -176,10 +200,14 @@ func (s *ConfigSynthesizer) synthesizeCodexKeys(ctx *SynthesisContext) []*coreau
 			Status:     coreauth.StatusActive,
 			ProxyURL:   proxyURL,
 			Attributes: attrs,
+			Metadata:   metadata,
 			CreatedAt:  now,
 			UpdatedAt:  now,
 		}
 		ApplyAuthExcludedModelsMeta(a, cfg, ck.ExcludedModels, "apikey")
+		if len(a.Metadata) == 0 {
+			a.Metadata = nil
+		}
 		out = append(out, a)
 	}
 	return out
@@ -194,12 +222,17 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 	out := make([]*coreauth.Auth, 0)
 	for i := range cfg.OpenAICompatibility {
 		compat := &cfg.OpenAICompatibility[i]
+		if compat.Disabled {
+			continue
+		}
 		prefix := strings.TrimSpace(compat.Prefix)
 		providerName := strings.ToLower(strings.TrimSpace(compat.Name))
 		if providerName == "" {
 			providerName = "openai-compatibility"
 		}
+		internalProviderKey := util.OpenAICompatibleProviderKey(providerName)
 		base := strings.TrimSpace(compat.BaseURL)
+		disableCooling := compat.DisableCooling
 
 		// Handle new APIKeyEntries format (preferred)
 		createdEntries := 0
@@ -213,7 +246,11 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"source":       fmt.Sprintf("config:%s[%s]", providerName, token),
 				"base_url":     base,
 				"compat_name":  compat.Name,
-				"provider_key": providerName,
+				"provider_key": internalProviderKey,
+			}
+			metadata := map[string]any{}
+			if disableCooling {
+				metadata["disable_cooling"] = true
 			}
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
@@ -227,14 +264,18 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			addConfigHeadersToAttrs(compat.Headers, attrs)
 			a := &coreauth.Auth{
 				ID:         id,
-				Provider:   providerName,
+				Provider:   internalProviderKey,
 				Label:      compat.Name,
 				Prefix:     prefix,
 				Status:     coreauth.StatusActive,
 				ProxyURL:   proxyURL,
 				Attributes: attrs,
+				Metadata:   metadata,
 				CreatedAt:  now,
 				UpdatedAt:  now,
+			}
+			if len(a.Metadata) == 0 {
+				a.Metadata = nil
 			}
 			out = append(out, a)
 			createdEntries++
@@ -247,7 +288,11 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 				"source":       fmt.Sprintf("config:%s[%s]", providerName, token),
 				"base_url":     base,
 				"compat_name":  compat.Name,
-				"provider_key": providerName,
+				"provider_key": internalProviderKey,
+			}
+			metadata := map[string]any{}
+			if disableCooling {
+				metadata["disable_cooling"] = true
 			}
 			if compat.Priority != 0 {
 				attrs["priority"] = strconv.Itoa(compat.Priority)
@@ -258,13 +303,17 @@ func (s *ConfigSynthesizer) synthesizeOpenAICompat(ctx *SynthesisContext) []*cor
 			addConfigHeadersToAttrs(compat.Headers, attrs)
 			a := &coreauth.Auth{
 				ID:         id,
-				Provider:   providerName,
+				Provider:   internalProviderKey,
 				Label:      compat.Name,
 				Prefix:     prefix,
 				Status:     coreauth.StatusActive,
 				Attributes: attrs,
+				Metadata:   metadata,
 				CreatedAt:  now,
 				UpdatedAt:  now,
+			}
+			if len(a.Metadata) == 0 {
+				a.Metadata = nil
 			}
 			out = append(out, a)
 		}
