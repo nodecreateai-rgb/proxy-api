@@ -441,6 +441,15 @@ nonstream-keepalive-interval: 0
 #       params: # JSON path (gjson/sjson syntax) -> value
 #         "reasoning.effort": "high"
 
+oauth-model-alias:
+  codex:
+    - name: "gpt-5.5"
+      alias: "gpt-5.5-fast"
+      fork: true
+    - name: "gpt-5.4"
+      alias: "gpt-5.4-fast"
+      fork: true
+
 payload:
     override:
         - models:
@@ -449,6 +458,22 @@ payload:
           params:
               "generationConfig.imageConfig.imageSize": "4K"
               "generationConfig.thinkingConfig.includeThoughts": false
+        - models:
+              - name: "gpt-5.5"
+                protocol: "codex"
+              - name: "gpt-5.4"
+                protocol: "codex"
+          match:
+              - "service_tier": "priority"
+          params:
+              service_tier: priority
+        - models:
+              - name: "gpt-5.5-fast"
+                protocol: "codex"
+              - name: "gpt-5.4-fast"
+                protocol: "codex"
+          params:
+              service_tier: priority
 openai-compatibility:
   - name: blink
     base-url: https://core.blink.new/api/v1/ai
