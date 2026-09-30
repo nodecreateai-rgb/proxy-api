@@ -1,7 +1,14 @@
 #!/bin/sh
 set -e
 
-if [ -f /CLIProxyAPI/config.example.yaml ]; then
+CONFIG_TEMPLATE=""
+if [ -f /CLIProxyAPI/config.docker.yaml ]; then
+    CONFIG_TEMPLATE="/CLIProxyAPI/config.docker.yaml"
+elif [ -f /CLIProxyAPI/config.example.yaml ]; then
+    CONFIG_TEMPLATE="/CLIProxyAPI/config.example.yaml"
+fi
+
+if [ -n "$CONFIG_TEMPLATE" ]; then
     echo "正在替换环境变量..."
     
     # 使用 awk 进行替换
@@ -30,7 +37,7 @@ if [ -f /CLIProxyAPI/config.example.yaml ]; then
         }
         print line
     }
-    ' /CLIProxyAPI/config.example.yaml > /CLIProxyAPI/config.yaml
+    ' "$CONFIG_TEMPLATE" > /CLIProxyAPI/config.yaml
     
     echo "环境变量替换完成"
 fi
