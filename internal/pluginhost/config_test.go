@@ -4,7 +4,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"gopkg.in/yaml.v3"
 )
 
@@ -47,5 +47,59 @@ func TestRuntimeConfigYAMLDefaultsEnabledFalse(t *testing.T) {
 		if !strings.Contains(got, want) {
 			t.Fatalf("runtimeConfigYAML() missing %q in:\n%s", want, got)
 		}
+	}
+}
+
+func TestRuntimeConfigFromConfigExtractsStoreVersion(t *testing.T) {
+	var node yaml.Node
+	if errDecode := yaml.Unmarshal([]byte("store:\n  version: 1.0.3\n  release-tag: v1.0.3\n"), &node); errDecode != nil {
+		t.Fatalf("yaml.Unmarshal() error = %v", errDecode)
+	}
+	enabled := true
+	cfg := &config.Config{
+		Plugins: config.PluginsConfig{
+			Enabled: true,
+			Configs: map[string]config.PluginInstanceConfig{
+				"alpha": {
+					Enabled: &enabled,
+					Raw:     *node.Content[0],
+				},
+			},
+		},
+	}
+
+	got, errRuntimeConfig := runtimeConfigFromConfig(cfg)
+	if errRuntimeConfig != nil {
+		t.Fatalf("runtimeConfigFromConfig() error = %v", errRuntimeConfig)
+	}
+	if got.Items["alpha"].Version != "1.0.3" {
+		t.Fatalf("runtimeConfigFromConfig() version = %q, want 1.0.3", got.Items["alpha"].Version)
+	}
+}
+
+func TestRuntimeConfigFromConfigDerivesStoreVersionFromReleaseTag(t *testing.T) {
+	var node yaml.Node
+	if errDecode := yaml.Unmarshal([]byte("store:\n  release-tag: v1.0.3\n"), &node); errDecode != nil {
+		t.Fatalf("yaml.Unmarshal() error = %v", errDecode)
+	}
+	enabled := true
+	cfg := &config.Config{
+		Plugins: config.PluginsConfig{
+			Enabled: true,
+			Configs: map[string]config.PluginInstanceConfig{
+				"alpha": {
+					Enabled: &enabled,
+					Raw:     *node.Content[0],
+				},
+			},
+		},
+	}
+
+	got, errRuntimeConfig := runtimeConfigFromConfig(cfg)
+	if errRuntimeConfig != nil {
+		t.Fatalf("runtimeConfigFromConfig() error = %v", errRuntimeConfig)
+	}
+	if got.Items["alpha"].Version != "1.0.3" {
+		t.Fatalf("runtimeConfigFromConfig() version = %q, want 1.0.3", got.Items["alpha"].Version)
 	}
 }

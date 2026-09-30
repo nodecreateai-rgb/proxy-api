@@ -1,9 +1,12 @@
 package responses
 
 import (
+	"bytes"
 	"encoding/json"
-	"fmt"
+	"strings"
 
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -12,38 +15,224 @@ import (
 func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte, _ bool) []byte {
 	rawJSON := inputRawJSON
 
-	inputResult := gjson.GetBytes(rawJSON, "input")
+	inputResult := util.GetGJSONBytesNoCopy(rawJSON, "input")
 	if inputResult.Type == gjson.String {
 		input, _ := sjson.SetBytes([]byte(`[{"type":"message","role":"user","content":[{"type":"input_text","text":""}]}]`), "0.content.0.text", inputResult.String())
 		rawJSON, _ = sjson.SetRawBytes(rawJSON, "input", input)
+		inputResult = util.GetGJSONBytesNoCopy(rawJSON, "input")
 	}
 
-	rawJSON, _ = sjson.SetBytes(rawJSON, "stream", true)
-	rawJSON, _ = sjson.SetBytes(rawJSON, "store", false)
-	rawJSON, _ = sjson.SetBytes(rawJSON, "parallel_tool_calls", true)
-	rawJSON, _ = sjson.SetBytes(rawJSON, "include", []string{"reasoning.encrypted_content"})
+	rawJSON = setCodexRequiredBool(rawJSON, "stream", true)
+	rawJSON = setCodexRequiredBool(rawJSON, "store", false)
+	rawJSON = setCodexRequiredBool(rawJSON, "parallel_tool_calls", true)
+	rawJSON = setCodexRequiredInclude(rawJSON)
 	// Codex Responses rejects token limit fields, so strip them out before forwarding.
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "max_output_tokens")
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "max_completion_tokens")
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "temperature")
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "top_p")
-	if v := gjson.GetBytes(rawJSON, "service_tier"); v.Exists() {
-		if v.String() != "priority" {
-			rawJSON, _ = sjson.DeleteBytes(rawJSON, "service_tier")
+	rawJSON = deleteCodexRequestFields(rawJSON, "max_output_tokens", "max_completion_tokens", "temperature", "top_p")
+	if serviceTier := gjson.GetBytes(rawJSON, "service_tier"); serviceTier.Exists() {
+		if serviceTier.Type == gjson.String {
+			switch strings.ToLower(strings.TrimSpace(serviceTier.String())) {
+			case "priority", "fast":
+				if serviceTier.String() != "priority" {
+					rawJSON, _ = sjson.SetBytes(rawJSON, "service_tier", "priority")
+				}
+			case "ultrafast":
+				if serviceTier.String() != "ultrafast" {
+					rawJSON, _ = sjson.SetBytes(rawJSON, "service_tier", "ultrafast")
+				}
+			default:
+				rawJSON = deleteCodexRequestFields(rawJSON, "service_tier")
+			}
+		} else {
+			rawJSON = deleteCodexRequestFields(rawJSON, "service_tier")
 		}
 	}
 
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "truncation")
+	rawJSON = deleteCodexRequestFields(rawJSON, "truncation", "prompt_cache_options", "prompt_cache_retention")
+	rawJSON = stripCodexResponsesCacheBreakpoints(rawJSON)
 	rawJSON = applyResponsesCompactionCompatibility(rawJSON)
 
 	// Delete the user field as it is not supported by the Codex upstream.
-	rawJSON, _ = sjson.DeleteBytes(rawJSON, "user")
+	rawJSON = deleteCodexRequestFields(rawJSON, "user")
 
 	// Convert role "system" to "developer" in input array to comply with Codex API requirements.
 	rawJSON = convertSystemRoleToDeveloper(rawJSON)
 	rawJSON = normalizeCodexBuiltinTools(rawJSON)
+	rawJSON = normalizeEmptyFunctionCallArguments(rawJSON)
 
 	return rawJSON
+}
+
+// normalizeEmptyFunctionCallArguments rewrites blank string arguments on
+// history function_call items to "{}". Some Responses clients serialize
+// parameter-less tool calls as an empty string, which strict Codex Responses
+// upstreams reject with "`arguments` must be valid JSON". Only blank strings
+// are touched: non-empty strings (even invalid JSON) pass through unchanged
+// so other errors keep their original shape, and custom_tool_call items use
+// the separate input field and are never affected.
+func normalizeEmptyFunctionCallArguments(rawJSON []byte) []byte {
+	inputResult := util.GetGJSONBytesNoCopy(rawJSON, "input")
+	if !inputResult.IsArray() {
+		return rawJSON
+	}
+	items := inputResult.Array()
+	if len(items) == 0 {
+		return rawJSON
+	}
+	changed := false
+	rebuilt := make([][]byte, 0, len(items))
+	for _, item := range items {
+		itemRaw := []byte(item.Raw)
+		if item.IsObject() && item.Get("type").String() == "function_call" {
+			if args := item.Get("arguments"); args.Type == gjson.String && strings.TrimSpace(args.String()) == "" {
+				if updated, errSet := sjson.SetBytes(itemRaw, "arguments", "{}"); errSet == nil {
+					itemRaw = updated
+					changed = true
+				}
+			}
+		}
+		rebuilt = append(rebuilt, itemRaw)
+	}
+	if !changed {
+		return rawJSON
+	}
+	updated, errSetRaw := sjson.SetRawBytes(rawJSON, "input", translatorcommon.JoinRawArray(rebuilt))
+	if errSetRaw != nil {
+		return rawJSON
+	}
+	return updated
+}
+
+func setCodexRequiredBool(rawJSON []byte, path string, value bool) []byte {
+	current := gjson.GetBytes(rawJSON, path)
+	if value && current.Type == gjson.True || !value && current.Type == gjson.False {
+		return rawJSON
+	}
+
+	updated, errSet := sjson.SetBytes(rawJSON, path, value)
+	if errSet != nil {
+		return rawJSON
+	}
+	return updated
+}
+
+func setCodexRequiredInclude(rawJSON []byte) []byte {
+	current := gjson.GetBytes(rawJSON, "include")
+	values := current.Array()
+	if current.IsArray() && len(values) == 1 && values[0].Type == gjson.String && values[0].String() == "reasoning.encrypted_content" {
+		return rawJSON
+	}
+
+	updated, errSet := sjson.SetRawBytes(rawJSON, "include", []byte(`["reasoning.encrypted_content"]`))
+	if errSet != nil {
+		return rawJSON
+	}
+	return updated
+}
+
+func deleteCodexRequestFields(rawJSON []byte, paths ...string) []byte {
+	for _, path := range paths {
+		if !gjson.GetBytes(rawJSON, path).Exists() {
+			continue
+		}
+
+		updated, errDelete := sjson.DeleteBytes(rawJSON, path)
+		if errDelete == nil {
+			rawJSON = updated
+		}
+	}
+	return rawJSON
+}
+
+// stripCodexResponsesCacheBreakpoints removes any "prompt_cache_breakpoint" hint
+// attached to input items: inside content-part arrays (message input[].content[]
+// and function_call_output input[].output[]) or as an item-level field. Some
+// clients (e.g. GitHub Copilot CLI) attach this field per content item when
+// targeting the OpenAI Responses format. Codex Responses rejects it outright:
+// {"error":{"message":"prompt_cache_breakpoint is not supported on this model", ...}}.
+// The top-level prompt_cache_options strip above does not cover these nested cases.
+func stripCodexResponsesCacheBreakpoints(rawJSON []byte) []byte {
+	if !bytes.Contains(rawJSON, []byte(`"prompt_cache_breakpoint"`)) {
+		return rawJSON
+	}
+
+	input := util.GetGJSONBytesNoCopy(rawJSON, "input")
+	if !input.IsArray() {
+		return rawJSON
+	}
+
+	inputItems := input.Array()
+	if len(inputItems) == 0 {
+		return rawJSON
+	}
+
+	changed := false
+	rebuiltInput := make([][]byte, 0, len(inputItems))
+	for _, item := range inputItems {
+		itemRaw := []byte(item.Raw)
+		for _, arrayPath := range []string{"content", "output"} {
+			arrayResult := item.Get(arrayPath)
+			if !arrayResult.IsArray() {
+				continue
+			}
+			updatedArray, arrayChanged := stripPromptCacheBreakpointFromContent(arrayResult)
+			if !arrayChanged {
+				continue
+			}
+			if updatedItem, errSet := sjson.SetRawBytes(itemRaw, arrayPath, updatedArray); errSet == nil {
+				itemRaw = updatedItem
+				changed = true
+			}
+		}
+		if item.Get("prompt_cache_breakpoint").Exists() {
+			if updatedItem, errDelete := sjson.DeleteBytes(itemRaw, "prompt_cache_breakpoint"); errDelete == nil {
+				itemRaw = updatedItem
+				changed = true
+			}
+		}
+		rebuiltInput = append(rebuiltInput, itemRaw)
+	}
+	if !changed {
+		return rawJSON
+	}
+
+	updated, errSet := sjson.SetRawBytes(rawJSON, "input", translatorcommon.JoinRawArray(rebuiltInput))
+	if errSet != nil {
+		return rawJSON
+	}
+	return updated
+}
+
+// stripPromptCacheBreakpointFromContent removes "prompt_cache_breakpoint" from each
+// content part that carries it and reports whether anything changed.
+func stripPromptCacheBreakpointFromContent(content gjson.Result) ([]byte, bool) {
+	parts := content.Array()
+	hasBreakpoint := false
+	for _, part := range parts {
+		if part.Get("prompt_cache_breakpoint").Exists() {
+			hasBreakpoint = true
+			break
+		}
+	}
+	if !hasBreakpoint {
+		return nil, false
+	}
+
+	changed := false
+	rebuiltParts := make([][]byte, 0, len(parts))
+	for _, part := range parts {
+		partRaw := []byte(part.Raw)
+		if part.Get("prompt_cache_breakpoint").Exists() {
+			if updated, errDelete := sjson.DeleteBytes(partRaw, "prompt_cache_breakpoint"); errDelete == nil {
+				partRaw = updated
+				changed = true
+			}
+		}
+		rebuiltParts = append(rebuiltParts, partRaw)
+	}
+	if !changed {
+		return nil, false
+	}
+	return translatorcommon.JoinRawArray(rebuiltParts), true
 }
 
 // applyResponsesCompactionCompatibility handles OpenAI Responses context_management.compaction
@@ -67,13 +256,27 @@ func applyResponsesCompactionCompatibility(rawJSON []byte) []byte {
 // with role "system" to role "developer". This is necessary because Codex API does not
 // accept "system" role in the input array.
 func convertSystemRoleToDeveloper(rawJSON []byte) []byte {
-	inputResult := gjson.GetBytes(rawJSON, "input")
+	return convertSystemRoleToDeveloperWithInput(rawJSON, util.GetGJSONBytesNoCopy(rawJSON, "input"))
+}
+
+func convertSystemRoleToDeveloperWithInput(rawJSON []byte, inputResult gjson.Result) []byte {
 	if !inputResult.IsArray() {
 		return rawJSON
 	}
 
 	inputItems := inputResult.Array()
 	if len(inputItems) == 0 {
+		return rawJSON
+	}
+
+	hasSystemRole := false
+	for _, item := range inputItems {
+		if item.IsObject() && item.Get("role").String() == "system" {
+			hasSystemRole = true
+			break
+		}
+	}
+	if !hasSystemRole {
 		return rawJSON
 	}
 
@@ -109,29 +312,43 @@ func convertSystemRoleToDeveloper(rawJSON []byte) []byte {
 // normalizeCodexBuiltinTools rewrites legacy/preview built-in tool variants to the
 // stable names expected by the current Codex upstream.
 func normalizeCodexBuiltinTools(rawJSON []byte) []byte {
-	result := rawJSON
-
-	tools := gjson.GetBytes(result, "tools")
-	if tools.IsArray() {
-		toolArray := tools.Array()
-		for i := 0; i < len(toolArray); i++ {
-			typePath := fmt.Sprintf("tools.%d.type", i)
-			result = normalizeCodexBuiltinToolAtPath(result, typePath)
-		}
-	}
-
+	result := normalizeCodexBuiltinToolArray(rawJSON, "tools")
 	result = normalizeCodexBuiltinToolAtPath(result, "tool_choice.type")
+	return normalizeCodexBuiltinToolArray(result, "tool_choice.tools")
+}
 
-	toolChoiceTools := gjson.GetBytes(result, "tool_choice.tools")
-	if toolChoiceTools.IsArray() {
-		toolArray := toolChoiceTools.Array()
-		for i := 0; i < len(toolArray); i++ {
-			typePath := fmt.Sprintf("tool_choice.tools.%d.type", i)
-			result = normalizeCodexBuiltinToolAtPath(result, typePath)
-		}
+func normalizeCodexBuiltinToolArray(rawJSON []byte, path string) []byte {
+	tools := gjson.GetBytes(rawJSON, path)
+	if !tools.IsArray() {
+		return rawJSON
 	}
 
-	return result
+	changed := false
+	var toolItems [][]byte
+	tools.ForEach(func(_, tool gjson.Result) bool {
+		item := []byte(tool.Raw)
+		currentType := tool.Get("type").String()
+		normalizedType := normalizeCodexBuiltinToolType(currentType)
+		if normalizedType != "" {
+			updated, errSetType := sjson.SetBytes(item, "type", normalizedType)
+			if errSetType == nil {
+				item = updated
+				changed = true
+				log.Debugf("codex responses: normalized builtin tool type at %s.%d.type from %q to %q", path, len(toolItems), currentType, normalizedType)
+			}
+		}
+		toolItems = append(toolItems, item)
+		return true
+	})
+	if !changed {
+		return rawJSON
+	}
+
+	updated, errSetTools := sjson.SetRawBytes(rawJSON, path, translatorcommon.JoinRawArray(toolItems))
+	if errSetTools != nil {
+		return rawJSON
+	}
+	return updated
 }
 
 func normalizeCodexBuiltinToolAtPath(rawJSON []byte, path string) []byte {

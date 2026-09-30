@@ -8,10 +8,10 @@ import (
 	"testing"
 	"time"
 
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	homekv "github.com/router-for-me/CLIProxyAPI/v7/internal/home"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/registry"
-	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	homekv "github.com/router-for-me/CLIProxyAPI/v8/internal/home"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -128,7 +128,7 @@ func TestManagerExecuteStream_AntigravityCreditsFallbackAfterBootstrap429(t *tes
 	}
 }
 
-func TestManagerExecuteStream_AntigravityCreditsHomeKVUnavailableFailsRequest(t *testing.T) {
+func TestManagerExecuteStream_AntigravityCreditsHomeModeFailsClosedWithoutDispatch(t *testing.T) {
 	const model = "claude-opus-4-6-thinking"
 	executor := &antigravityCreditsFallbackExecutor{}
 	manager := NewManager(nil, nil, nil)
@@ -152,8 +152,8 @@ func TestManagerExecuteStream_AntigravityCreditsHomeKVUnavailableFailsRequest(t 
 	if status := statusCodeFromError(errExecute); status != http.StatusServiceUnavailable {
 		t.Fatalf("ExecuteStream() status = %d, want %d; err=%v", status, http.StatusServiceUnavailable, errExecute)
 	}
-	if !strings.Contains(errExecute.Error(), "home kv store unavailable") {
-		t.Fatalf("ExecuteStream() error = %v, want home kv store unavailable", errExecute)
+	if !strings.Contains(errExecute.Error(), "home dispatch bundle unavailable") {
+		t.Fatalf("ExecuteStream() error = %v, want home dispatch bundle unavailable", errExecute)
 	}
 }
 

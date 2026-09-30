@@ -3,20 +3,25 @@ package pluginhost
 import (
 	"sort"
 	"strings"
+	"sync"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 )
 
 type capabilityRecord struct {
 	id       string
+	path     string
+	version  string
 	priority int
 	meta     pluginapi.Metadata
 	plugin   pluginapi.Plugin
 }
 
 type Snapshot struct {
-	enabled bool
-	records []capabilityRecord
+	enabled                   bool
+	records                   []capabilityRecord
+	quotaSupportedProvidersMu sync.RWMutex
+	quotaSupportedProviders   map[string][]string
 }
 
 // RegisteredPluginInfo describes a plugin that is active in the current runtime snapshot.
@@ -25,6 +30,9 @@ type RegisteredPluginInfo struct {
 	Priority      int
 	Metadata      pluginapi.Metadata
 	SupportsOAuth bool
+	OAuthProvider string
+	SupportsQuota bool
+	QuotaProvider string
 	Menus         []RegisteredPluginMenu
 }
 
@@ -36,23 +44,59 @@ type RegisteredPluginMenu struct {
 }
 
 func emptySnapshot() *Snapshot {
-	return &Snapshot{}
+	return &Snapshot{
+		quotaSupportedProviders: make(map[string][]string),
+	}
+}
+
+func (h *Host) activeRecords() []capabilityRecord {
+	return h.activeRecordsFromSnapshot(h.Snapshot())
+}
+
+func (h *Host) activeRecordsFromSnapshot(snap *Snapshot) []capabilityRecord {
+	if snap == nil || len(snap.records) == 0 {
+		return nil
+	}
+	out := make([]capabilityRecord, 0, len(snap.records))
+	for _, record := range snap.records {
+		if h.recordCurrent(record) {
+			out = append(out, record)
+		}
+	}
+	return out
 }
 
 // RegisteredPlugins returns a stable copy of plugin metadata in the current runtime snapshot.
 func (h *Host) RegisteredPlugins() []RegisteredPluginInfo {
-	snap := h.Snapshot()
-	if snap == nil || len(snap.records) == 0 {
+	records := h.activeRecords()
+	if len(records) == 0 {
 		return nil
 	}
 	menusByPlugin := h.registeredPluginMenus()
-	out := make([]RegisteredPluginInfo, 0, len(snap.records))
-	for _, record := range snap.records {
+	out := make([]RegisteredPluginInfo, 0, len(records))
+	for _, record := range records {
+		authProvider := record.plugin.Capabilities.AuthProvider
+		oauthProvider := ""
+		if authProvider != nil && !h.isPluginFused(record.id) {
+			if identifier, okIdentifier := h.callAuthProviderIdentifier(record.id, authProvider); okIdentifier {
+				oauthProvider = identifier
+			}
+		}
+		quotaProvider := record.plugin.Capabilities.QuotaProvider
+		quotaIdentifier := ""
+		if quotaProvider != nil && !h.isPluginFused(record.id) {
+			if identifier, okIdentifier := h.callQuotaIdentifier(record.id, quotaProvider); okIdentifier {
+				quotaIdentifier = identifier
+			}
+		}
 		out = append(out, RegisteredPluginInfo{
 			ID:            record.id,
 			Priority:      record.priority,
 			Metadata:      clonePluginMetadata(record.meta),
-			SupportsOAuth: record.plugin.Capabilities.AuthProvider != nil,
+			SupportsOAuth: authProvider != nil,
+			OAuthProvider: oauthProvider,
+			SupportsQuota: quotaProvider != nil,
+			QuotaProvider: quotaIdentifier,
 			Menus:         menusByPlugin[record.id],
 		})
 	}
@@ -68,11 +112,7 @@ func (h *Host) PluginRegistered(id string) bool {
 	if id == "" {
 		return false
 	}
-	snap := h.Snapshot()
-	if snap == nil || len(snap.records) == 0 {
-		return false
-	}
-	for _, record := range snap.records {
+	for _, record := range h.activeRecords() {
 		if record.id == id {
 			return true
 		}

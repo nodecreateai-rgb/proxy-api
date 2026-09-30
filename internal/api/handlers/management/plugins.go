@@ -11,10 +11,10 @@ import (
 	"strings"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/htmlsanitize"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/pluginhost"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/htmlsanitize"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/pluginhost"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	"gopkg.in/yaml.v3"
 )
 
@@ -32,6 +32,9 @@ type pluginListEntry struct {
 	Enabled          bool                    `json:"enabled"`
 	EffectiveEnabled bool                    `json:"effective_enabled"`
 	SupportsOAuth    bool                    `json:"supports_oauth"`
+	OAuthProvider    string                  `json:"oauth_provider"`
+	SupportsQuota    bool                    `json:"supports_quota"`
+	QuotaProvider    string                  `json:"quota_provider,omitempty"`
 	Logo             string                  `json:"logo"`
 	ConfigFields     []pluginConfigFieldInfo `json:"config_fields"`
 	Menus            []pluginMenuInfo        `json:"menus"`
@@ -80,8 +83,14 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 	host := h.pluginHost
 	h.mu.Unlock()
 
+	resolvedPluginsDir, errResolvePluginsDir := config.ResolvePluginsDir(pluginsDir)
+	if errResolvePluginsDir != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_directory_invalid", "message": errResolvePluginsDir.Error()})
+		return
+	}
+	pluginsDir = resolvedPluginsDir
 	entries := make(map[string]pluginListEntry)
-	files, errDiscover := pluginhost.DiscoverPluginFiles(pluginsDir)
+	files, errDiscover := pluginhost.DiscoverPluginFiles(pluginsDir, pluginStoreDesiredVersions(configs))
 	if errDiscover != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_discovery_failed", "message": errDiscover.Error()})
 		return
@@ -114,6 +123,9 @@ func (h *Handler) ListPlugins(c *gin.Context) {
 			entry.ID = htmlsanitize.String(info.ID)
 			entry.Registered = true
 			entry.SupportsOAuth = info.SupportsOAuth
+			entry.OAuthProvider = htmlsanitize.String(info.OAuthProvider)
+			entry.SupportsQuota = info.SupportsQuota
+			entry.QuotaProvider = htmlsanitize.String(info.QuotaProvider)
 			entry.Logo = htmlsanitize.String(info.Metadata.Logo)
 			entry.ConfigFields = pluginConfigFields(info.Metadata.ConfigFields)
 			entry.Menus = pluginMenus(info.Menus)
@@ -183,7 +195,12 @@ func (h *Handler) GetPluginConfig(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{})
 		return
 	}
-	discovered, errDiscover := pluginDiscovered(pluginsDir, id)
+	resolvedPluginsDir, errResolvePluginsDir := config.ResolvePluginsDir(pluginsDir)
+	if errResolvePluginsDir != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_directory_invalid", "message": errResolvePluginsDir.Error()})
+		return
+	}
+	discovered, errDiscover := pluginDiscovered(resolvedPluginsDir, id)
 	if errDiscover != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_discovery_failed", "message": errDiscover.Error()})
 		return
@@ -320,11 +337,21 @@ func (h *Handler) DeletePlugin(c *gin.Context) {
 		return
 	}
 	pluginsDir := normalizedPluginsDir(h.cfg.Plugins.Dir)
-	_, configured := h.cfg.Plugins.Configs[id]
+	item, configured := h.cfg.Plugins.Configs[id]
 	host := h.pluginHost
 	h.mu.Unlock()
 
-	path, errPath := pluginFilePath(pluginsDir, id)
+	resolvedPluginsDir, errResolvePluginsDir := config.ResolvePluginsDir(pluginsDir)
+	if errResolvePluginsDir != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_directory_invalid", "message": errResolvePluginsDir.Error()})
+		return
+	}
+	pluginsDir = resolvedPluginsDir
+	var desiredVersions map[string]string
+	if configured {
+		desiredVersions = pluginStoreDesiredVersions(map[string]config.PluginInstanceConfig{id: item})
+	}
+	path, errPath := pluginFilePath(pluginsDir, id, desiredVersions)
 	if errPath != nil {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "plugin_discovery_failed", "message": errPath.Error()})
 		return
@@ -358,7 +385,7 @@ func (h *Handler) DeletePlugin(c *gin.Context) {
 	h.mu.Lock()
 	delete(h.cfg.Plugins.Configs, id)
 	if configured {
-		if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg); errSave != nil {
+		if errSave := config.SaveConfigPreserveComments(h.configFilePath, h.cfg, c.GetBool(ConfigV8ContextKey)); errSave != nil {
 			h.mu.Unlock()
 			c.JSON(http.StatusInternalServerError, gin.H{
 				"error":        "config_save_failed",
@@ -423,8 +450,8 @@ func pluginDiscovered(pluginsDir string, id string) (bool, error) {
 	return false, nil
 }
 
-func pluginFilePath(pluginsDir string, id string) (string, error) {
-	files, errDiscover := pluginhost.DiscoverPluginFiles(pluginsDir)
+func pluginFilePath(pluginsDir string, id string, desiredVersions ...map[string]string) (string, error) {
+	files, errDiscover := pluginhost.DiscoverPluginFiles(pluginsDir, desiredVersions...)
 	if errDiscover != nil {
 		return "", errDiscover
 	}

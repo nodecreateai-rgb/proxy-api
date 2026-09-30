@@ -3,8 +3,8 @@ package cliproxy
 import (
 	"testing"
 
-	coreauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/config"
+	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/config"
 )
 
 func TestHasNativeOpenAICompatExecutorConfig(t *testing.T) {
@@ -50,7 +50,7 @@ func TestHasNativeOpenAICompatExecutorConfig(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := service.hasNativeOpenAICompatExecutorConfig(tt.auth, tt.providerKey)
+			got := service.hasNativeOpenAICompatExecutorConfig(tt.auth, tt.providerKey, service.cfg)
 			if got != tt.want {
 				t.Fatalf("hasNativeOpenAICompatExecutorConfig() = %v, want %v", got, tt.want)
 			}

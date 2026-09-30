@@ -9,9 +9,9 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/watcher/diff"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/watcher/diff"
 	"gopkg.in/yaml.v3"
 
 	log "github.com/sirupsen/logrus"
@@ -125,9 +125,9 @@ func (w *Watcher) reloadConfig() bool {
 	if oldConfig != nil {
 		details := diff.BuildConfigChangeDetails(oldConfig, newConfig)
 		if len(details) > 0 {
-			log.Debugf("config changes detected:")
+			log.Info("config changes detected:")
 			for _, d := range details {
-				log.Debugf("  %s", d)
+				log.Infof("  %s", d)
 			}
 		} else {
 			log.Debugf("no material config field changes detected")

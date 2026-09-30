@@ -12,21 +12,16 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 )
 
 // aiAPIPrefixes defines path prefixes for AI API requests that should have request ID tracking.
 var aiAPIPrefixes = []string{
-	"/v1/chat/completions",
-	"/v1/completions",
-	"/v1/images",
-	"/v1/videos",
-	"/v1/messages",
-	"/v1/responses",
-	"/openai/v1/videos",
-	"/v1beta/models/",
-	"/backend-api/codex/",
+	"/v1",
+	"/v1beta",
+	"/openai/v1",
+	"/backend-api/codex",
 }
 
 const (
@@ -52,13 +47,24 @@ func GinLogrusLogger() gin.HandlerFunc {
 		// Only generate request ID for AI API paths
 		var requestID string
 		if isAIAPIPath(path) {
-			requestID = GenerateRequestID()
-			SetGinRequestID(c, requestID)
-			ctx := WithRequestID(c.Request.Context(), requestID)
-			c.Request = c.Request.WithContext(ctx)
+			generatedID, errGenerate := GenerateRequestID()
+			if errGenerate != nil {
+				log.WithError(errGenerate).Error("failed to generate request ID")
+			} else {
+				requestID = generatedID
+				SetGinRequestID(c, requestID)
+				ctx := WithRequestID(c.Request.Context(), requestID)
+				c.Request = c.Request.WithContext(ctx)
+			}
 		}
 
 		c.Next()
+
+		// Keep failed health probes visible, including responses from global middleware.
+		if path == "/healthz" && (c.Request.Method == http.MethodGet || c.Request.Method == http.MethodHead) &&
+			c.Writer.Status() >= http.StatusOK && c.Writer.Status() < http.StatusMultipleChoices {
+			return
+		}
 
 		if shouldSkipGinRequestLogging(c) {
 			return
@@ -107,7 +113,7 @@ func GinLogrusLogger() gin.HandlerFunc {
 // isAIAPIPath checks if the given path is an AI API endpoint that should have request ID tracking.
 func isAIAPIPath(path string) bool {
 	for _, prefix := range aiAPIPrefixes {
-		if strings.HasPrefix(path, prefix) {
+		if path == prefix || strings.HasPrefix(path, prefix+"/") {
 			return true
 		}
 	}

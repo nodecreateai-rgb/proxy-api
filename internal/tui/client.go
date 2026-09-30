@@ -18,15 +18,35 @@ type Client struct {
 	http      *http.Client
 }
 
-// NewClient creates a new management API client.
+// NewClient creates a new management API client targeting localhost on the given port.
 func NewClient(port int, secretKey string) *Client {
+	return NewClientWithBaseURL(fmt.Sprintf("http://127.0.0.1:%d", port), secretKey)
+}
+
+// NewClientWithBaseURL creates a new management API client targeting the specified base URL.
+func NewClientWithBaseURL(baseURL string, secretKey string) *Client {
+	baseURL = strings.TrimSpace(baseURL)
+	if baseURL == "" {
+		baseURL = "http://127.0.0.1:8317"
+	} else {
+		lower := strings.ToLower(baseURL)
+		if !strings.HasPrefix(lower, "http://") && !strings.HasPrefix(lower, "https://") {
+			baseURL = "http://" + baseURL
+		}
+		baseURL = strings.TrimRight(baseURL, "/")
+	}
 	return &Client{
-		baseURL:   fmt.Sprintf("http://127.0.0.1:%d", port),
+		baseURL:   baseURL,
 		secretKey: strings.TrimSpace(secretKey),
 		http: &http.Client{
 			Timeout: 10 * time.Second,
 		},
 	}
+}
+
+// BaseURL returns the client's configured management API base URL.
+func (c *Client) BaseURL() string {
+	return c.baseURL
 }
 
 // SetSecretKey updates management API bearer token used by this client.
@@ -180,6 +200,16 @@ func (c *Client) PatchAuthFileFields(name string, fields map[string]any) error {
 	return err
 }
 
+// RefreshAuthFile triggers a forced refresh of a single auth credential.
+func (c *Client) RefreshAuthFile(name string) error {
+	return c.postJSON("/v0/management/auth-files/refresh", map[string]any{"name": name})
+}
+
+// RefreshAllAuthFiles triggers a forced refresh of all auth credentials.
+func (c *Client) RefreshAllAuthFiles() error {
+	return c.postJSON("/v0/management/auth-files/refresh", map[string]any{"all": true})
+}
+
 // GetLogs fetches log lines from the server.
 func (c *Client) GetLogs(after int64, limit int) ([]string, int64, error) {
 	query := url.Values{}
@@ -290,6 +320,12 @@ func (c *Client) GetGeminiKeys() ([]map[string]any, error) {
 	return c.getWrappedKeyList("/v0/management/gemini-api-key", "gemini-api-key")
 }
 
+// GetInteractionsKeys fetches native Interactions API keys.
+// API returns {"interactions-api-key": [...]}.
+func (c *Client) GetInteractionsKeys() ([]map[string]any, error) {
+	return c.getWrappedKeyList("/v0/management/interactions-api-key", "interactions-api-key")
+}
+
 // GetClaudeKeys fetches Claude API keys.
 func (c *Client) GetClaudeKeys() ([]map[string]any, error) {
 	return c.getWrappedKeyList("/v0/management/claude-api-key", "claude-api-key")
@@ -298,6 +334,11 @@ func (c *Client) GetClaudeKeys() ([]map[string]any, error) {
 // GetCodexKeys fetches Codex API keys.
 func (c *Client) GetCodexKeys() ([]map[string]any, error) {
 	return c.getWrappedKeyList("/v0/management/codex-api-key", "codex-api-key")
+}
+
+// GetXAIKeys fetches xAI API keys.
+func (c *Client) GetXAIKeys() ([]map[string]any, error) {
+	return c.getWrappedKeyList("/v0/management/xai-api-key", "xai-api-key")
 }
 
 // GetVertexKeys fetches Vertex API keys.
@@ -363,6 +404,25 @@ func (c *Client) GetAuthStatus(state string) (string, string, error) {
 	status := getString(wrapper, "status")
 	errMsg := getString(wrapper, "error")
 	return status, errMsg, nil
+}
+
+// CancelAuthSession cancels a pending OAuth session on the management server.
+func (c *Client) CancelAuthSession(state string) error {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return nil
+	}
+	query := url.Values{}
+	query.Set("state", state)
+	path := "/v0/management/oauth-session?" + query.Encode()
+	_, code, err := c.doRequest("DELETE", path, nil)
+	if err != nil {
+		return err
+	}
+	if code >= 400 {
+		return fmt.Errorf("HTTP %d", code)
+	}
+	return nil
 }
 
 // ----- Config field update methods -----

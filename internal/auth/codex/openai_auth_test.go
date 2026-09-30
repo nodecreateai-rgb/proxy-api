@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -18,6 +18,49 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
 	return f(req)
+}
+
+func TestNewCodexAuthDoesNotSetRequestTimeout(t *testing.T) {
+	if got := NewCodexAuth(nil).httpClient.Timeout; got != 0 {
+		t.Fatalf("HTTP client timeout = %s, want zero", got)
+	}
+}
+
+func TestRefreshTokens_UsesIndependentTimeout(t *testing.T) {
+	resetCodexRefreshGroupForTest()
+	defer resetCodexRefreshGroupForTest()
+
+	callerCtx, cancelCaller := context.WithCancel(context.Background())
+	cancelCaller()
+	var requestDeadline time.Time
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				var ok bool
+				requestDeadline, ok = req.Context().Deadline()
+				if !ok {
+					t.Fatal("refresh request has no deadline")
+				}
+				if errContext := req.Context().Err(); errContext != nil {
+					t.Fatalf("refresh request context is already done: %v", errContext)
+				}
+				return &http.Response{
+					StatusCode: http.StatusBadRequest,
+					Body:       io.NopCloser(strings.NewReader(`{"error":"probe"}`)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	_, err := auth.RefreshTokens(callerCtx, "independent-timeout-token")
+	if err == nil {
+		t.Fatal("expected refresh error")
+	}
+	if requestDeadline.IsZero() || !requestDeadline.After(time.Now()) {
+		t.Fatalf("refresh deadline = %v, want a future deadline", requestDeadline)
+	}
 }
 
 func resetCodexRefreshGroupForTest() {
@@ -148,5 +191,116 @@ func TestNewCodexAuthWithProxyURL_OverrideProxyTakesPrecedence(t *testing.T) {
 	}
 	if proxyURL == nil || proxyURL.String() != "http://override.example.com:8081" {
 		t.Fatalf("proxy URL = %v, want http://override.example.com:8081", proxyURL)
+	}
+}
+
+func TestRefreshTokens_PlanTypeDefaultsToFreeWhenMissing(t *testing.T) {
+	resetCodexRefreshGroupForTest()
+	defer resetCodexRefreshGroupForTest()
+
+	idTokenWithoutPlan := makeTestJWT(map[string]any{
+		"email": "user@example.com",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acc-12345",
+		},
+	})
+
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body := `{"access_token":"at-1","refresh_token":"rt-1","id_token":"` + idTokenWithoutPlan + `","token_type":"Bearer","expires_in":3600}`
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(body)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	tokenData, errRefresh := auth.RefreshTokens(context.Background(), "dummy-refresh")
+	if errRefresh != nil {
+		t.Fatalf("RefreshTokens failed: %v", errRefresh)
+	}
+	if tokenData == nil {
+		t.Fatal("tokenData is nil")
+	}
+	if got := tokenData.PlanType; got != "free" {
+		t.Fatalf("tokenData.PlanType = %q, want free", got)
+	}
+}
+
+func TestRefreshTokens_ExtractsPlanTypeWhenPresent(t *testing.T) {
+	resetCodexRefreshGroupForTest()
+	defer resetCodexRefreshGroupForTest()
+
+	idTokenWithPlan := makeTestJWT(map[string]any{
+		"email": "user@example.com",
+		"https://api.openai.com/auth": map[string]any{
+			"chatgpt_account_id": "acc-12345",
+			"chatgpt_plan_type":  "pro",
+		},
+	})
+
+	auth := &CodexAuth{
+		httpClient: &http.Client{
+			Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				body := `{"access_token":"at-1","refresh_token":"rt-1","id_token":"` + idTokenWithPlan + `","token_type":"Bearer","expires_in":3600}`
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Body:       io.NopCloser(strings.NewReader(body)),
+					Header:     make(http.Header),
+					Request:    req,
+				}, nil
+			}),
+		},
+	}
+
+	tokenData, errRefresh := auth.RefreshTokens(context.Background(), "dummy-refresh")
+	if errRefresh != nil {
+		t.Fatalf("RefreshTokens failed: %v", errRefresh)
+	}
+	if tokenData == nil {
+		t.Fatal("tokenData is nil")
+	}
+	if got := tokenData.PlanType; got != "pro" {
+		t.Fatalf("tokenData.PlanType = %q, want pro", got)
+	}
+}
+
+func TestCreateAndUpdateTokenStorage_PlanType(t *testing.T) {
+	auth := NewCodexAuth(nil)
+
+	// Test CreateTokenStorage with missing plan type
+	bundleDefault := &CodexAuthBundle{
+		TokenData: CodexTokenData{
+			IDToken:     "id-tok",
+			AccessToken: "acc-tok",
+		},
+	}
+	storage := auth.CreateTokenStorage(bundleDefault)
+	if storage.PlanType != "free" {
+		t.Fatalf("storage.PlanType = %q, want free", storage.PlanType)
+	}
+
+	// Test UpdateTokenStorage with plan type
+	auth.UpdateTokenStorage(storage, &CodexTokenData{
+		IDToken:     "id-tok-2",
+		AccessToken: "acc-tok-2",
+		PlanType:    "team",
+	})
+	if storage.PlanType != "team" {
+		t.Fatalf("updated storage.PlanType = %q, want team", storage.PlanType)
+	}
+
+	// Test UpdateTokenStorage with empty plan type defaults to free
+	auth.UpdateTokenStorage(storage, &CodexTokenData{
+		IDToken:     "id-tok-3",
+		AccessToken: "acc-tok-3",
+		PlanType:    "",
+	})
+	if storage.PlanType != "free" {
+		t.Fatalf("updated storage.PlanType = %q, want free", storage.PlanType)
 	}
 }

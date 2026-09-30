@@ -14,35 +14,38 @@ import (
 	"time"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
-	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/misc"
+	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
 )
 
 const (
-	defaultConfigTable = "config_store"
-	defaultAuthTable   = "auth_store"
-	defaultConfigKey   = "config"
+	defaultConfigTable   = "config_store"
+	defaultAuthTable     = "auth_store"
+	defaultCooldownTable = "cooldown_store"
+	defaultConfigKey     = "config"
 )
 
 // PostgresStoreConfig captures configuration required to initialize a Postgres-backed store.
 type PostgresStoreConfig struct {
-	DSN         string
-	Schema      string
-	ConfigTable string
-	AuthTable   string
-	SpoolDir    string
+	DSN           string
+	Schema        string
+	ConfigTable   string
+	AuthTable     string
+	CooldownTable string
+	SpoolDir      string
 }
 
 // PostgresStore persists configuration and authentication metadata using PostgreSQL as backend
 // while mirroring data to a local workspace so existing file-based workflows continue to operate.
 type PostgresStore struct {
-	db         *sql.DB
-	cfg        PostgresStoreConfig
-	spoolRoot  string
-	configPath string
-	authDir    string
-	mu         sync.Mutex
+	db            *sql.DB
+	cfg           PostgresStoreConfig
+	spoolRoot     string
+	configPath    string
+	authDir       string
+	cooldownStore *postgresCooldownStateStore
+	mu            sync.Mutex
 }
 
 // NewPostgresStore establishes a connection to PostgreSQL and prepares the local workspace.
@@ -57,6 +60,9 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 	}
 	if cfg.AuthTable == "" {
 		cfg.AuthTable = defaultAuthTable
+	}
+	if cfg.CooldownTable == "" {
+		cfg.CooldownTable = defaultCooldownTable
 	}
 
 	spoolRoot := strings.TrimSpace(cfg.SpoolDir)
@@ -96,6 +102,7 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 		configPath: filepath.Join(configDir, "config.yaml"),
 		authDir:    authDir,
 	}
+	store.cooldownStore = &postgresCooldownStateStore{store: store}
 	return store, nil
 }
 
@@ -139,6 +146,20 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 		)
 	`, authTable)); err != nil {
 		return fmt.Errorf("postgres store: create auth table: %w", err)
+	}
+	cooldownTable := s.fullTableName(s.cfg.CooldownTable)
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			auth_id TEXT NOT NULL,
+			model TEXT NOT NULL DEFAULT '',
+			content JSONB NOT NULL,
+			deleted BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+			PRIMARY KEY (auth_id, model)
+		)
+	`, cooldownTable)); err != nil {
+		return fmt.Errorf("postgres store: create cooldown table: %w", err)
 	}
 	return nil
 }
@@ -190,6 +211,10 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 	if auth == nil {
 		return "", fmt.Errorf("postgres store: auth is nil")
 	}
+	cliproxyauth.NormalizeCredentialMetadata(auth.Metadata)
+	if errWeight := cliproxyauth.ValidateAuthWeight(auth); errWeight != nil {
+		return "", fmt.Errorf("postgres store: %w", errWeight)
+	}
 
 	path, err := s.resolveAuthPath(auth)
 	if err != nil {
@@ -199,7 +224,10 @@ func (s *PostgresStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (stri
 		return "", fmt.Errorf("postgres store: missing file path attribute for %s", auth.ID)
 	}
 
-	if auth.Disabled {
+	// Runtime updates must not recreate a disabled credential whose source file
+	// was deliberately removed. Login and migration callers explicitly mark the
+	// save when creating a missing disabled credential is intentional.
+	if auth.Disabled && !cliproxyauth.HasAuthCreationIntent(ctx) {
 		if _, statErr := os.Stat(path); errors.Is(statErr, fs.ErrNotExist) {
 			return "", nil
 		}
@@ -296,6 +324,11 @@ func (s *PostgresStore) List(ctx context.Context) ([]*cliproxyauth.Auth, error) 
 		metadata := make(map[string]any)
 		if err = json.Unmarshal([]byte(payload), &metadata); err != nil {
 			log.WithError(err).Warnf("postgres store: skipping auth %s with invalid json", id)
+			continue
+		}
+		cliproxyauth.NormalizeCredentialMetadata(metadata)
+		if errWeight := cliproxyauth.ValidateAuthWeight(&cliproxyauth.Auth{Metadata: metadata}); errWeight != nil {
+			log.WithError(errWeight).Warnf("postgres store: skipping auth %s with invalid weight", id)
 			continue
 		}
 		provider := strings.TrimSpace(valueAsString(metadata["type"]))

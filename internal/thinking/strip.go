@@ -35,15 +35,26 @@ func StripThinkingConfig(body []byte, provider string) []byte {
 		paths = []string{"generationConfig.thinkingConfig"}
 	case "antigravity":
 		paths = []string{"request.generationConfig.thinkingConfig"}
+	case "interactions":
+		paths = []string{
+			"generation_config.thinking_level",
+			"generation_config.thinkingLevel",
+			"generation_config.thinking_budget",
+			"generation_config.thinkingBudget",
+			"generation_config.thinking_summaries",
+			"generation_config.thinkingSummaries",
+			"generation_config.thinking_config",
+			"generation_config.thinkingConfig",
+		}
 	case "openai":
-		paths = []string{"reasoning_effort"}
-	case "kimi":
+		paths = []string{"reasoning_effort", "reasoning"}
+	case "kimi", "kimi-ai", "kimi.ai", "kimi.com":
 		paths = []string{
 			"reasoning_effort",
 			"thinking",
 		}
 	case "codex", "xai":
-		paths = []string{"reasoning.effort"}
+		paths = []string{"reasoning"}
 	default:
 		return body
 	}

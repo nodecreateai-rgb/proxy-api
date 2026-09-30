@@ -9,8 +9,10 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
+	"gopkg.in/yaml.v3"
 )
 
 type testSymbolLoader struct {
@@ -46,6 +48,9 @@ func newTestSymbolLookup(plugin *testPlugin) *testSymbolLookup {
 }
 
 func (l *testSymbolLookup) Call(ctx context.Context, method string, request []byte) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	switch method {
 	case pluginabi.MethodPluginRegister:
 		return l.callLifecycle(request, false)
@@ -92,6 +97,18 @@ func (l *testSymbolLookup) Call(ctx context.Context, method string, request []by
 			return nil, errIntercept
 		}
 		return marshalRPCResult(resp)
+	case pluginabi.MethodRequestComplete:
+		if l.active.Capabilities.RequestLifecyclePlugin == nil {
+			return nil, fmt.Errorf("missing request lifecycle plugin")
+		}
+		var req pluginapi.RequestCompletion
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+		if errComplete := l.active.Capabilities.RequestLifecyclePlugin.HandleRequestComplete(ctx, req); errComplete != nil {
+			return nil, errComplete
+		}
+		return marshalRPCResult(rpcEmptyResponse{})
 	case pluginabi.MethodResponseInterceptAfter:
 		if l.active.Capabilities.ResponseInterceptor == nil {
 			return nil, fmt.Errorf("missing response interceptor")
@@ -159,6 +176,50 @@ func (l *testSymbolLookup) Call(ctx context.Context, method string, request []by
 		}
 		l.active.Capabilities.UsagePlugin.HandleUsage(ctx, record)
 		return marshalRPCResult(rpcEmptyResponse{})
+	case pluginabi.MethodQuotaIdentifier:
+		if l.active.Capabilities.QuotaProvider == nil {
+			return nil, fmt.Errorf("missing quota provider")
+		}
+		return marshalRPCResult(rpcIdentifierResponse{Identifier: l.active.Capabilities.QuotaProvider.Identifier()})
+	case pluginabi.MethodQuotaDescribe:
+		if l.active.Capabilities.QuotaProvider == nil {
+			return nil, fmt.Errorf("missing quota provider")
+		}
+		var req pluginapi.QuotaDescribeRequest
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+		resp, errDescribe := l.active.Capabilities.QuotaProvider.DescribeQuota(ctx, req)
+		if errDescribe != nil {
+			return nil, errDescribe
+		}
+		return marshalRPCResult(resp)
+	case pluginabi.MethodQuotaFetch:
+		if l.active.Capabilities.QuotaProvider == nil {
+			return nil, fmt.Errorf("missing quota provider")
+		}
+		var req rpcQuotaFetchRequest
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+		resp, errFetch := l.active.Capabilities.QuotaProvider.FetchQuota(ctx, req.QuotaFetchRequest)
+		if errFetch != nil {
+			return nil, errFetch
+		}
+		return marshalRPCResult(resp)
+	case pluginabi.MethodQuotaReset:
+		if l.active.Capabilities.QuotaProvider == nil {
+			return nil, fmt.Errorf("missing quota provider")
+		}
+		var req rpcQuotaResetRequest
+		if errUnmarshal := json.Unmarshal(request, &req); errUnmarshal != nil {
+			return nil, errUnmarshal
+		}
+		resp, errReset := l.active.Capabilities.QuotaProvider.ResetQuota(ctx, req.QuotaResetRequest)
+		if errReset != nil {
+			return nil, errReset
+		}
+		return marshalRPCResult(resp)
 	default:
 		return nil, fmt.Errorf("missing test method %s", method)
 	}
@@ -242,6 +303,13 @@ func validTestPlugin(name string) pluginapi.Plugin {
 type testUsageCapability struct{}
 
 func (testUsageCapability) HandleUsage(ctx context.Context, record pluginapi.UsageRecord) {}
+
+type requestLifecyclePluginFunc func(context.Context, pluginapi.RequestCompletion)
+
+func (f requestLifecyclePluginFunc) HandleRequestComplete(ctx context.Context, completion pluginapi.RequestCompletion) error {
+	f(ctx, completion)
+	return nil
+}
 
 type testThinkingCapability struct {
 	provider string
@@ -332,4 +400,40 @@ func makePluginDir(t *testing.T, ids ...string) string {
 		}
 	}
 	return root
+}
+
+func makeVersionedPluginDir(t *testing.T, id string, versions ...string) (string, map[string]string) {
+	t.Helper()
+	root := t.TempDir()
+	paths := make(map[string]string, len(versions))
+	for _, version := range versions {
+		paths[version] = writeVersionedPluginFile(t, root, id, version)
+	}
+	return root, paths
+}
+
+func writeVersionedPluginFile(t *testing.T, root, id, version string) string {
+	t.Helper()
+	archDir := filepath.Join(root, runtime.GOOS, runtime.GOARCH)
+	if errMkdirAll := os.MkdirAll(archDir, 0o755); errMkdirAll != nil {
+		t.Fatalf("MkdirAll() error = %v", errMkdirAll)
+	}
+	path := filepath.Join(archDir, fmt.Sprintf("%s-v%s%s", id, version, pluginExtension(runtime.GOOS)))
+	if errWriteFile := os.WriteFile(path, []byte("x"), 0o644); errWriteFile != nil {
+		t.Fatalf("WriteFile(%s) error = %v", path, errWriteFile)
+	}
+	return path
+}
+
+func enabledPluginConfigWithStoreVersion(t *testing.T, version string) config.PluginInstanceConfig {
+	t.Helper()
+	var node yaml.Node
+	if errDecode := yaml.Unmarshal([]byte(fmt.Sprintf("store:\n  version: %s\n", version)), &node); errDecode != nil {
+		t.Fatalf("yaml.Unmarshal() error = %v", errDecode)
+	}
+	enabled := true
+	return config.PluginInstanceConfig{
+		Enabled: &enabled,
+		Raw:     *node.Content[0],
+	}
 }

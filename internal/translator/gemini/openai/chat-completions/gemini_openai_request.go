@@ -3,13 +3,12 @@
 package chat_completions
 
 import (
-	"fmt"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/misc"
-	sigcompat "github.com/router-for-me/CLIProxyAPI/v7/internal/signature"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/translator/gemini/common"
-	"github.com/router-for-me/CLIProxyAPI/v7/internal/util"
+	sigcompat "github.com/router-for-me/CLIProxyAPI/v8/internal/signature"
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v8/internal/translator/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/translator/gemini/common"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	log "github.com/sirupsen/logrus"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -49,10 +48,8 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 			thinkingPath := "generationConfig.thinkingConfig"
 			if effort == "auto" {
 				out, _ = sjson.SetBytes(out, thinkingPath+".thinkingBudget", -1)
-				out, _ = sjson.SetBytes(out, thinkingPath+".includeThoughts", true)
 			} else {
 				out, _ = sjson.SetBytes(out, thinkingPath+".thinkingLevel", effort)
-				out, _ = sjson.SetBytes(out, thinkingPath+".includeThoughts", effort != "none")
 			}
 		}
 	}
@@ -68,12 +65,22 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 		out, _ = sjson.SetBytes(out, "generationConfig.topK", tkr.Num)
 	}
 
+	// OpenAI max_tokens / max_completion_tokens -> Gemini generationConfig.maxOutputTokens
+	if mt := gjson.GetBytes(rawJSON, "max_tokens"); mt.Exists() && mt.Type == gjson.Number {
+		out, _ = sjson.SetBytes(out, "generationConfig.maxOutputTokens", mt.Num)
+	} else if mct := gjson.GetBytes(rawJSON, "max_completion_tokens"); mct.Exists() && mct.Type == gjson.Number {
+		out, _ = sjson.SetBytes(out, "generationConfig.maxOutputTokens", mct.Num)
+	}
+
 	// Candidate count (OpenAI 'n' parameter)
 	if n := gjson.GetBytes(rawJSON, "n"); n.Exists() && n.Type == gjson.Number {
 		if val := n.Int(); val > 1 {
 			out, _ = sjson.SetBytes(out, "generationConfig.candidateCount", val)
 		}
 	}
+
+	// Map OpenAI response_format to Gemini structured output settings.
+	out = applyOpenAIResponseFormatToGemini(out, rawJSON)
 
 	// Map OpenAI modalities -> Gemini generationConfig.responseModalities
 	// e.g. "modalities": ["image", "text"] -> ["IMAGE", "TEXT"]
@@ -107,93 +114,49 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 	messages := gjson.GetBytes(rawJSON, "messages")
 	if messages.IsArray() {
 		arr := messages.Array()
-		// First pass: assistant tool_calls id->name map
-		tcID2Name := map[string]string{}
-		for i := 0; i < len(arr); i++ {
-			m := arr[i]
-			if m.Get("role").String() == "assistant" {
-				tcs := m.Get("tool_calls")
-				if tcs.IsArray() {
-					for _, tc := range tcs.Array() {
-						if tc.Get("type").String() == "function" {
-							id := tc.Get("id").String()
-							name := tc.Get("function.name").String()
-							if id != "" && name != "" {
-								tcID2Name[id] = name
-							}
-						}
-					}
-				}
-			}
-		}
+		systemParts := make([][]byte, 0, 2)
+		contentItems := make([][]byte, 0, len(arr))
 
-		// Second pass build systemInstruction/tool responses cache
-		toolResponses := map[string]string{} // tool_call_id -> response text
-		for i := 0; i < len(arr); i++ {
-			m := arr[i]
-			role := m.Get("role").String()
-			if role == "tool" {
-				toolCallID := m.Get("tool_call_id").String()
-				if toolCallID != "" {
-					c := m.Get("content")
-					toolResponses[toolCallID] = c.Raw
-				}
-			}
-		}
-
-		systemPartIndex := 0
+		hasEncounteredConversation := false
 		for i := 0; i < len(arr); i++ {
 			m := arr[i]
 			role := m.Get("role").String()
 			content := m.Get("content")
 
-			if (role == "system" || role == "developer") && len(arr) > 1 {
+			if (role == "system" || role == "developer") && len(arr) > 1 && !hasEncounteredConversation {
 				// system -> systemInstruction as a user message style
 				if content.Type == gjson.String {
-					out, _ = sjson.SetBytes(out, "systemInstruction.role", "user")
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("systemInstruction.parts.%d.text", systemPartIndex), content.String())
-					systemPartIndex++
+					systemParts = append(systemParts, geminiTextPart(content.String()))
 				} else if content.IsObject() && content.Get("type").String() == "text" {
-					out, _ = sjson.SetBytes(out, "systemInstruction.role", "user")
-					out, _ = sjson.SetBytes(out, fmt.Sprintf("systemInstruction.parts.%d.text", systemPartIndex), content.Get("text").String())
-					systemPartIndex++
+					systemParts = append(systemParts, geminiTextPart(content.Get("text").String()))
 				} else if content.IsArray() {
 					contents := content.Array()
-					if len(contents) > 0 {
-						out, _ = sjson.SetBytes(out, "systemInstruction.role", "user")
-						for j := 0; j < len(contents); j++ {
-							out, _ = sjson.SetBytes(out, fmt.Sprintf("systemInstruction.parts.%d.text", systemPartIndex), contents[j].Get("text").String())
-							systemPartIndex++
-						}
+					for j := 0; j < len(contents); j++ {
+						systemParts = append(systemParts, geminiTextPart(contents[j].Get("text").String()))
 					}
 				}
-			} else if role == "user" || ((role == "system" || role == "developer") && len(arr) == 1) {
-				// Build single user content node to avoid splitting into multiple contents
-				node := []byte(`{"role":"user","parts":[]}`)
+			} else if role == "user" || role == "system" || role == "developer" {
+				hasEncounteredConversation = true
+				isDemotedSystem := role == "system" || role == "developer"
+				// Build single user content node to avoid splitting into multiple contents.
+				partItems := make([][]byte, 0, 4)
 				if content.Type == gjson.String {
-					node, _ = sjson.SetBytes(node, "parts.0.text", content.String())
+					partItems = append(partItems, geminiTextPart(geminiDemotedSystemText(content.String(), isDemotedSystem)))
+				} else if content.IsObject() && content.Get("type").String() == "text" {
+					partItems = append(partItems, geminiTextPart(geminiDemotedSystemText(content.Get("text").String(), isDemotedSystem)))
 				} else if content.IsArray() {
-					items := content.Array()
-					p := 0
-					for _, item := range items {
+					for _, item := range content.Array() {
 						switch item.Get("type").String() {
 						case "text":
-							text := item.Get("text").String()
-							if text != "" {
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", text)
-								p++
+							if text := item.Get("text").String(); text != "" {
+								partItems = append(partItems, geminiTextPart(geminiDemotedSystemText(text, isDemotedSystem)))
 							}
 						case "image_url":
 							imageURL := item.Get("image_url.url").String()
 							if len(imageURL) > 5 {
 								pieces := strings.SplitN(imageURL[5:], ";", 2)
 								if len(pieces) == 2 && len(pieces[1]) > 7 {
-									mime := pieces[0]
-									data := pieces[1][7:]
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mime)
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", data)
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiFunctionThoughtSignature)
-									p++
+									partItems = append(partItems, geminiInlineDataPart(pieces[0], pieces[1][7:], ""))
 								}
 							}
 						case "video_url":
@@ -201,141 +164,190 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 							if len(videoURL) > 5 {
 								pieces := strings.SplitN(videoURL[5:], ";", 2)
 								if len(pieces) == 2 && len(pieces[1]) > 7 {
-									mime := pieces[0]
-									data := pieces[1][7:]
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mime)
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", data)
-									p++
+									partItems = append(partItems, geminiInlineDataPart(pieces[0], pieces[1][7:], ""))
 								}
 							}
 						case "file":
 							filename := item.Get("file.filename").String()
 							fileData := item.Get("file.file_data").String()
-							ext := ""
-							if sp := strings.Split(filename, "."); len(sp) > 1 {
-								ext = sp[len(sp)-1]
-							}
-							if mimeType, ok := misc.MimeTypes[ext]; ok {
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mimeType)
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", fileData)
-								p++
+							if mimeType, data, ok := translatorcommon.NormalizeOpenAIFileData(filename, "", fileData); ok {
+								partItems = append(partItems, geminiInlineDataPart(mimeType, data, ""))
 							} else {
-								log.Warnf("Unknown file name extension '%s' in user message, skip", ext)
+								log.Warn("Invalid file data or unknown file name extension in user message, skip")
 							}
 						case "input_audio":
 							audioData := item.Get("input_audio.data").String()
 							if audioData != "" {
 								mimeType := openAIInputAudioMimeType(item.Get("input_audio.format").String())
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mimeType)
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", audioData)
-								p++
+								partItems = append(partItems, geminiInlineDataPart(mimeType, audioData, ""))
 							}
 						}
 					}
 				}
-				out, _ = sjson.SetRawBytes(out, "contents.-1", node)
+				if len(partItems) > 0 {
+					contentItems = append(contentItems, geminiContentNode("user", partItems))
+				}
 			} else if role == "assistant" {
-				node := []byte(`{"role":"model","parts":[]}`)
-				p := 0
-				if content.Type == gjson.String {
-					// Assistant text -> single model content
-					node, _ = sjson.SetBytes(node, "parts.-1.text", content.String())
-					p++
+				hasEncounteredConversation = true
+				partItems := make([][]byte, 0, 4)
+				if reasoningContent := m.Get("reasoning_content"); reasoningContent.Type == gjson.String && reasoningContent.String() != "" {
+					part := geminiTextPart(reasoningContent.String())
+					part, _ = sjson.SetBytes(part, "thought", true)
+					partItems = append(partItems, part)
+				}
+				if content.Type == gjson.String && content.String() != "" {
+					partItems = append(partItems, geminiTextPart(content.String()))
 				} else if content.IsArray() {
-					// Assistant multimodal content (e.g. text + image) -> single model content with parts
+					// Assistant multimodal content (e.g. text + image) -> single model content with parts.
 					for _, item := range content.Array() {
 						switch item.Get("type").String() {
 						case "text":
-							text := item.Get("text").String()
-							if text != "" {
-								node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".text", text)
-								p++
+							if text := item.Get("text").String(); text != "" {
+								partItems = append(partItems, geminiTextPart(text))
 							}
 						case "image_url":
-							// If the assistant returned an inline data URL, preserve it for history fidelity.
 							imageURL := item.Get("image_url.url").String()
-							if len(imageURL) > 5 { // expect data:...
+							if len(imageURL) > 5 {
 								pieces := strings.SplitN(imageURL[5:], ";", 2)
 								if len(pieces) == 2 && len(pieces[1]) > 7 {
-									mime := pieces[0]
-									data := pieces[1][7:]
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.mime_type", mime)
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".inlineData.data", data)
-									node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", geminiFunctionThoughtSignature)
-									p++
+									partItems = append(partItems, geminiInlineDataPart(pieces[0], pieces[1][7:], ""))
 								}
 							}
 						}
 					}
 				}
 
-				// Tool calls -> single model content with functionCall parts
+				// Tool calls -> single model content with functionCall parts.
 				tcs := m.Get("tool_calls")
 				if tcs.IsArray() {
-					fIDs := make([]string, 0)
+					type assistantToolCall struct {
+						id   string
+						name string
+					}
+					toolCalls := make([]assistantToolCall, 0)
 					for _, tc := range tcs.Array() {
 						if tc.Get("type").String() != "function" {
 							continue
 						}
-						fid := tc.Get("id").String()
-						fname := util.SanitizeFunctionName(tc.Get("function.name").String())
-						fargs := tc.Get("function.arguments").String()
-						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".functionCall.name", fname)
-						node, _ = sjson.SetRawBytes(node, "parts."+itoa(p)+".functionCall.args", []byte(fargs))
-						node, _ = sjson.SetBytes(node, "parts."+itoa(p)+".thoughtSignature", openAIToolCallGeminiThoughtSignature(tc))
-						p++
-						if fid != "" {
-							fIDs = append(fIDs, fid)
+						functionID := tc.Get("id").String()
+						functionName := util.SanitizeFunctionName(tc.Get("function.name").String())
+						if functionName == "" {
+							continue
 						}
+						part := []byte(`{"functionCall":{"name":""}}`)
+						part, _ = sjson.SetBytes(part, "functionCall.name", functionName)
+						part, _ = sjson.SetRawBytes(part, "functionCall.args", []byte(tc.Get("function.arguments").String()))
+						part, _ = sjson.SetBytes(part, "thoughtSignature", openAIToolCallGeminiThoughtSignature(tc))
+						partItems = append(partItems, part)
+						toolCalls = append(toolCalls, assistantToolCall{
+							id:   functionID,
+							name: functionName,
+						})
 					}
-					out, _ = sjson.SetRawBytes(out, "contents.-1", node)
+					if len(partItems) > 0 {
+						contentItems = append(contentItems, geminiContentNode("model", partItems))
+					}
 
-					// Append a single tool content combining name + response per function
-					toolNode := []byte(`{"role":"user","parts":[]}`)
-					pp := 0
-					for _, fid := range fIDs {
-						if name, ok := tcID2Name[fid]; ok {
-							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.name", util.SanitizeFunctionName(name))
-							resp := toolResponses[fid]
-							if resp == "" {
-								resp = "{}"
+					// Collect tool responses scoped to this assistant turn.
+					turnToolResponses := map[string]string{}
+					for j := i + 1; j < len(arr); j++ {
+						nextRole := arr[j].Get("role").String()
+						if nextRole == "assistant" {
+							break
+						}
+						if nextRole == "tool" {
+							callID := arr[j].Get("tool_call_id").String()
+							if callID != "" {
+								c := arr[j].Get("content")
+								turnToolResponses[callID] = c.Raw
 							}
-							toolNode, _ = sjson.SetBytes(toolNode, "parts."+itoa(pp)+".functionResponse.response.result", []byte(resp))
-							pp++
 						}
 					}
-					if pp > 0 {
-						out, _ = sjson.SetRawBytes(out, "contents.-1", toolNode)
+
+					// Append a single tool content combining name + response per function.
+					responseParts := make([][]byte, 0, len(toolCalls))
+					for _, call := range toolCalls {
+						part := []byte(`{"functionResponse":{"name":"","response":{"result":""}}}`)
+						part, _ = sjson.SetBytes(part, "functionResponse.name", call.name)
+						response := turnToolResponses[call.id]
+						if response == "" {
+							response = "{}"
+						}
+						part, _ = sjson.SetBytes(part, "functionResponse.response.result", []byte(response))
+						responseParts = append(responseParts, part)
 					}
-				} else {
-					out, _ = sjson.SetRawBytes(out, "contents.-1", node)
+					if len(responseParts) > 0 {
+						contentItems = append(contentItems, geminiContentNode("user", responseParts))
+					}
+				} else if len(partItems) > 0 {
+					contentItems = append(contentItems, geminiContentNode("model", partItems))
 				}
 			}
 		}
-	}
 
-	// Gemini/Vertex accepts assistant/model turns in history, but some model
-	// surfaces reject requests whose final turn is model-authored prefill.
-	contents := gjson.GetBytes(out, "contents")
-	if contents.Exists() && contents.IsArray() {
-		arr := contents.Array()
-		if len(arr) > 0 && arr[len(arr)-1].Get("role").String() == "model" {
-			out, _ = sjson.DeleteBytes(out, fmt.Sprintf("contents.%d", len(arr)-1))
+		if len(systemParts) > 0 {
+			systemInstruction := geminiContentNode("user", systemParts)
+			out, _ = sjson.SetRawBytes(out, "systemInstruction", systemInstruction)
 		}
+		if len(contentItems) > 0 && gjson.GetBytes(contentItems[len(contentItems)-1], "role").String() == "model" {
+			contentItems = contentItems[:len(contentItems)-1]
+		}
+		out = translatorcommon.SetRawArrayItems(out, "contents", contentItems)
 	}
 
 	// tools -> tools[].functionDeclarations + tools[].googleSearch/codeExecution/urlContext passthrough
+	allowedToolNames := make(map[string]struct{})
+	isAllowedTools := false
+	allowedMode := "auto"
+	if toolChoice := gjson.GetBytes(rawJSON, "tool_choice"); toolChoice.Exists() && toolChoice.IsObject() && toolChoice.Get("type").String() == "allowed_tools" {
+		isAllowedTools = true
+		toolList := toolChoice.Get("allowed_tools.tools").Array()
+		if len(toolList) == 0 {
+			toolList = toolChoice.Get("tools").Array()
+		}
+		for _, t := range toolList {
+			fnName := strings.TrimSpace(t.Get("function.name").String())
+			if fnName == "" {
+				fnName = strings.TrimSpace(t.Get("name").String())
+			}
+			if fnName != "" {
+				allowedToolNames[fnName] = struct{}{}
+			}
+		}
+		modeVal := strings.ToLower(strings.TrimSpace(toolChoice.Get("allowed_tools.mode").String()))
+		if modeVal == "" {
+			modeVal = strings.ToLower(strings.TrimSpace(toolChoice.Get("mode").String()))
+		}
+		if modeVal != "" {
+			allowedMode = modeVal
+		}
+	}
+
+	declaredOriginalToSanitized := make(map[string]string)
+	sanitizedToOriginalCounts := make(map[string]int)
+	var functionDeclarations [][]byte
+	hasStrictTool := false
 	tools := gjson.GetBytes(rawJSON, "tools")
-	if tools.IsArray() && len(tools.Array()) > 0 {
-		functionToolNode := []byte(`{}`)
-		hasFunction := false
+	toolResults := tools.Array()
+	if tools.IsArray() && len(toolResults) > 0 {
+		functionDeclarations = make([][]byte, 0, len(toolResults))
 		googleSearchNodes := make([][]byte, 0)
 		codeExecutionNodes := make([][]byte, 0)
 		urlContextNodes := make([][]byte, 0)
-		for _, t := range tools.Array() {
+		for _, t := range toolResults {
 			if t.Get("type").String() == "function" {
 				fn := t.Get("function")
 				if fn.Exists() && fn.IsObject() {
+					nameResult := fn.Get("name")
+					originalName := nameResult.String()
+					if isAllowedTools {
+						if _, ok := allowedToolNames[originalName]; !ok {
+							continue
+						}
+					}
+					sanitizedName := util.SanitizeFunctionName(originalName)
+					sanitizedToOriginalCounts[sanitizedName]++
+					declaredOriginalToSanitized[originalName] = sanitizedName
 					fnRaw := fn.Raw
 					if fn.Get("parameters").Exists() {
 						renamed, errRename := util.RenameKey(fnRaw, "parameters", "parametersJsonSchema")
@@ -373,22 +385,31 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 						fnRaw = string(fnRawBytes)
 					}
 					fnRawBytes := []byte(fnRaw)
-					fnRawBytes, _ = sjson.SetBytes(fnRawBytes, "name", util.SanitizeFunctionName(fn.Get("name").String()))
-					fnRaw = string(fnRawBytes)
-					if parameters := gjson.Get(fnRaw, "parametersJsonSchema"); parameters.Exists() {
-						fnRaw, _ = sjson.SetRaw(fnRaw, "parametersJsonSchema", util.CleanJSONSchemaForGemini(parameters.Raw))
+					if nameResult.Type != gjson.String || sanitizedName != originalName {
+						fnRawBytes, _ = sjson.SetBytes(fnRawBytes, "name", sanitizedName)
 					}
-					fnRaw, _ = sjson.Delete(fnRaw, "strict")
-					if !hasFunction {
-						functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", []byte("[]"))
+					if parameters := gjson.GetBytes(fnRawBytes, "parametersJsonSchema"); parameters.Exists() {
+						cleanedParameters := util.CleanJSONSchemaForGeminiJSONSchema(parameters.Raw)
+						if cleanedParameters != parameters.Raw {
+							fnRawBytes, _ = sjson.SetRawBytes(fnRawBytes, "parametersJsonSchema", []byte(cleanedParameters))
+						}
 					}
-					tmp, errSet := sjson.SetRawBytes(functionToolNode, "functionDeclarations.-1", []byte(fnRaw))
-					if errSet != nil {
-						log.Warnf("Failed to append tool declaration for '%s': %v", fn.Get("name").String(), errSet)
-						continue
+					strictVal := gjson.GetBytes(fnRawBytes, "strict")
+					if !strictVal.Exists() {
+						strictVal = fn.Get("strict")
+						if !strictVal.Exists() {
+							strictVal = t.Get("strict")
+						}
 					}
-					functionToolNode = tmp
-					hasFunction = true
+					if strictVal.Exists() {
+						if strictVal.Type == gjson.True {
+							hasStrictTool = true
+						}
+						if gjson.GetBytes(fnRawBytes, "strict").Exists() {
+							fnRawBytes, _ = sjson.DeleteBytes(fnRawBytes, "strict")
+						}
+					}
+					functionDeclarations = append(functionDeclarations, fnRawBytes)
 				}
 			}
 			if gs := t.Get("google_search"); gs.Exists() {
@@ -422,27 +443,124 @@ func ConvertOpenAIRequestToGemini(modelName string, inputRawJSON []byte, _ bool)
 				urlContextNodes = append(urlContextNodes, urlToolNode)
 			}
 		}
-		if hasFunction || len(googleSearchNodes) > 0 || len(codeExecutionNodes) > 0 || len(urlContextNodes) > 0 {
-			toolsNode := []byte("[]")
-			if hasFunction {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", functionToolNode)
+		if len(functionDeclarations) > 0 || len(googleSearchNodes) > 0 || len(codeExecutionNodes) > 0 || len(urlContextNodes) > 0 {
+			toolItems := make([][]byte, 0, 1+len(googleSearchNodes)+len(codeExecutionNodes)+len(urlContextNodes))
+			if len(functionDeclarations) > 0 {
+				functionToolNode := []byte(`{"functionDeclarations":[]}`)
+				functionToolNode, _ = sjson.SetRawBytes(functionToolNode, "functionDeclarations", translatorcommon.JoinRawArray(functionDeclarations))
+				toolItems = append(toolItems, functionToolNode)
 			}
-			for _, googleNode := range googleSearchNodes {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", googleNode)
-			}
-			for _, codeNode := range codeExecutionNodes {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", codeNode)
-			}
-			for _, urlNode := range urlContextNodes {
-				toolsNode, _ = sjson.SetRawBytes(toolsNode, "-1", urlNode)
-			}
-			out, _ = sjson.SetRawBytes(out, "tools", toolsNode)
+			toolItems = append(toolItems, googleSearchNodes...)
+			toolItems = append(toolItems, codeExecutionNodes...)
+			toolItems = append(toolItems, urlContextNodes...)
+			out, _ = sjson.SetRawBytes(out, "tools", translatorcommon.JoinRawArray(toolItems))
 		}
+	}
+
+	hasSanitizedCollision := false
+	for _, count := range sanitizedToOriginalCounts {
+		if count > 1 {
+			hasSanitizedCollision = true
+			break
+		}
+	}
+
+	// tool_choice mapping
+	if hasSanitizedCollision {
+		// Ambiguous collision in function names: fail-closed to prevent invoking unintended tools.
+		out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "NONE")
+	} else if isAllowedTools {
+		if len(functionDeclarations) == 0 {
+			// Fail-closed when no allowed tools match or subset is empty.
+			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "NONE")
+		} else if allowedMode == "required" || allowedMode == "any" {
+			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "ANY")
+			allowedList := make([]string, 0, len(functionDeclarations))
+			for _, fnRaw := range functionDeclarations {
+				allowedList = append(allowedList, gjson.GetBytes(fnRaw, "name").String())
+			}
+			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.allowedFunctionNames", allowedList)
+		} else if hasStrictTool {
+			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "VALIDATED")
+		} else {
+			// Mode AUTO: functionDeclarations contains only allowed tools, mode is AUTO without allowedFunctionNames.
+			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "AUTO")
+		}
+	} else if toolChoice := gjson.GetBytes(rawJSON, "tool_choice"); toolChoice.Exists() && toolChoice.Type != gjson.Null {
+		toolChoiceType := ""
+		if toolChoice.Type == gjson.String {
+			toolChoiceType = strings.ToLower(strings.TrimSpace(toolChoice.String()))
+		} else if toolChoice.IsObject() {
+			toolChoiceType = strings.ToLower(strings.TrimSpace(toolChoice.Get("type").String()))
+		}
+
+		switch toolChoiceType {
+		case "auto":
+			if hasStrictTool {
+				out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "VALIDATED")
+			} else {
+				out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "AUTO")
+			}
+		case "none":
+			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "NONE")
+		case "required", "any":
+			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "ANY")
+		case "function", "tool":
+			fnName := strings.TrimSpace(toolChoice.Get("function.name").String())
+			if fnName == "" {
+				fnName = strings.TrimSpace(toolChoice.Get("name").String())
+			}
+			sanitized, declared := declaredOriginalToSanitized[fnName]
+			if declared && sanitizedToOriginalCounts[sanitized] == 1 {
+				out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "ANY")
+				out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.allowedFunctionNames", []string{sanitized})
+			} else {
+				// Missing, undeclared, or ambiguous: fail-closed.
+				out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "NONE")
+			}
+		default:
+			// Unrecognized tool_choice type: fail-closed.
+			out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "NONE")
+		}
+	} else if hasStrictTool && len(functionDeclarations) > 0 {
+		out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "VALIDATED")
+	}
+
+	// parallel_tool_calls handling:
+	// Gemini function calling has no parameter to disable parallel tool calls while keeping tools enabled.
+	// As a safe fail-closed measure when explicit restrictions cannot be faithfully expressed,
+	// when parallel_tool_calls is explicitly false, mode is set to NONE.
+	if parallelToolCalls := gjson.GetBytes(rawJSON, "parallel_tool_calls"); parallelToolCalls.Type == gjson.False {
+		out, _ = sjson.SetBytes(out, "toolConfig.functionCallingConfig.mode", "NONE")
+		out, _ = sjson.DeleteBytes(out, "toolConfig.functionCallingConfig.allowedFunctionNames")
 	}
 
 	out = common.AttachDefaultSafetySettings(out, "safetySettings")
 
 	return out
+}
+
+func geminiTextPart(text string) []byte {
+	part := []byte(`{"text":""}`)
+	part, _ = sjson.SetBytes(part, "text", text)
+	return part
+}
+
+func geminiInlineDataPart(mimeType, data, thoughtSignature string) []byte {
+	part := []byte(`{"inlineData":{"mime_type":"","data":""}}`)
+	part, _ = sjson.SetBytes(part, "inlineData.mime_type", mimeType)
+	part, _ = sjson.SetBytes(part, "inlineData.data", data)
+	if thoughtSignature != "" {
+		part, _ = sjson.SetBytes(part, "thoughtSignature", thoughtSignature)
+	}
+	return part
+}
+
+func geminiContentNode(role string, parts [][]byte) []byte {
+	content := []byte(`{"role":"","parts":[]}`)
+	content, _ = sjson.SetBytes(content, "role", role)
+	content, _ = sjson.SetRawBytes(content, "parts", translatorcommon.JoinRawArray(parts))
+	return content
 }
 
 func openAIToolCallGeminiThoughtSignature(toolCall gjson.Result) string {
@@ -458,9 +576,6 @@ func openAIToolCallGeminiThoughtSignature(toolCall gjson.Result) string {
 	}
 	return geminiFunctionThoughtSignature
 }
-
-// itoa converts int to string without strconv import for few usages.
-func itoa(i int) string { return fmt.Sprintf("%d", i) }
 
 func openAIInputAudioMimeType(audioFormat string) string {
 	switch audioFormat {
@@ -483,4 +598,36 @@ func openAIInputAudioMimeType(audioFormat string) string {
 	default:
 		return "audio/" + audioFormat
 	}
+}
+
+// applyOpenAIResponseFormatToGemini maps OpenAI Chat Completions structured output settings to Gemini.
+// Response schemas pass through unchanged because the tool schema cleaner removes supported response fields.
+func applyOpenAIResponseFormatToGemini(out []byte, rawJSON []byte) []byte {
+	responseFormat := gjson.GetBytes(rawJSON, "response_format")
+	if !responseFormat.Exists() {
+		return out
+	}
+
+	switch strings.ToLower(strings.TrimSpace(responseFormat.Get("type").String())) {
+	case "json_object":
+		out, _ = sjson.SetBytes(out, "generationConfig.responseMimeType", "application/json")
+	case "json_schema":
+		out, _ = sjson.SetBytes(out, "generationConfig.responseMimeType", "application/json")
+		out, _ = sjson.DeleteBytes(out, "generationConfig.responseSchema")
+		if schema := responseFormat.Get("json_schema.schema"); schema.Exists() {
+			out, _ = sjson.SetRawBytes(out, "generationConfig.responseJsonSchema", []byte(schema.Raw))
+		}
+	}
+
+	return out
+}
+
+// geminiDemotedSystemText wraps a demoted mid-session system or developer
+// message in the <system-reminder> envelope so non-Claude upstream models treat it
+// as a directive rather than user speech.
+func geminiDemotedSystemText(text string, isDemoted bool) string {
+	if !isDemoted || strings.TrimSpace(text) == "" {
+		return text
+	}
+	return translatorcommon.SystemReminderText(text)
 }

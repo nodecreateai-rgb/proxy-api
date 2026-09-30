@@ -7,28 +7,58 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
+	internallogging "github.com/router-for-me/CLIProxyAPI/v8/internal/logging"
 	log "github.com/sirupsen/logrus"
 )
 
-// DefaultServiceTier is used when a request does not specify service_tier.
+// DefaultServiceTier is retained for direct SDK and non-OpenAI usage callers.
 const DefaultServiceTier = "default"
+
+// AutoServiceTier is the OpenAI request semantics when service_tier is omitted.
+// OpenAI HTTP handlers set it explicitly, without changing other providers'
+// historical direct-SDK default.
+const AutoServiceTier = "auto"
 
 // Record contains the usage statistics captured for a single provider request.
 type Record struct {
+	// RequestID uniquely identifies this specific model execution instance (UUID v4).
+	RequestID string
+	// TraceID identifies the parent inbound HTTP request when available (8-character hex).
+	TraceID  string
 	Provider string
+	// BaseURL stores the configured upstream base URL when available.
+	BaseURL string
 	// ExecutorType stores the concrete executor type that handled the request.
-	ExecutorType string
-	Model        string
-	Alias        string
-	APIKey       string
-	AuthID       string
-	AuthIndex    string
-	AuthType     string
-	Source       string
+	ExecutorType    string
+	Model           string
+	Alias           string
+	APIKey          string
+	SessionID       string
+	ParentSessionID string
+	AuthID          string
+	AuthIndex       string
+	// AccessTokenSHA256 identifies the OAuth token version without exposing the token.
+	AccessTokenSHA256 string
+	AuthType          string
+	Source            string
 	// ReasoningEffort stores the translated upstream thinking level for request event logs.
 	ReasoningEffort string
-	// ServiceTier stores the client-requested service tier for request event logs.
+	// ServiceTier stores the client-requested service tier.
 	ServiceTier string
+	// RequestServiceTier is a deprecated input-only alias retained for existing
+	// plugin callers. It is normalized into ServiceTier and never emitted.
+	RequestServiceTier string
+	// ResponseServiceTier stores the final tier reported by the upstream response.
+	ResponseServiceTier string
+	// ResponseModel stores the model name reported by the upstream response, empty when unknown.
+	ResponseModel string
+	// Generate reports whether the client requested actual generation.
+	// nil or true means generation is enabled; only an explicit false disables generation.
+	// Use GenerateFlag to set the value and GenerateEnabled to read it with the default.
+	Generate *bool
+	// Stream reports whether the request was executed in streaming mode.
+	Stream      bool
 	RequestedAt time.Time
 	Latency     time.Duration
 	TTFT        time.Duration
@@ -54,11 +84,55 @@ type Detail struct {
 	CacheReadTokens     int64
 	CacheCreationTokens int64
 	TotalTokens         int64
+	TokenBreakdown      TokenBreakdown
+	ResponseServiceTier string
 }
 
 type requestedModelAliasContextKey struct{}
 type reasoningEffortContextKey struct{}
 type serviceTierContextKey struct{}
+type generateContextKey struct{}
+type streamContextKey struct{}
+type executionRequestIDContextKey struct{}
+type executionTraceIDContextKey struct{}
+
+// WithExecutionRequestID attaches a specific execution instance request ID to the context.
+func WithExecutionRequestID(ctx context.Context, requestID string) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithValue(ctx, executionRequestIDContextKey{}, strings.TrimSpace(requestID))
+}
+
+// ExecutionRequestIDFromContext retrieves the execution instance request ID from the context.
+func ExecutionRequestIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(executionRequestIDContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
+
+// WithTraceID attaches the parent inbound HTTP request ID to the context.
+func WithTraceID(ctx context.Context, traceID string) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return context.WithValue(ctx, executionTraceIDContextKey{}, strings.TrimSpace(traceID))
+}
+
+// TraceIDFromContext retrieves the parent inbound HTTP request ID from the context.
+func TraceIDFromContext(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	if v, ok := ctx.Value(executionTraceIDContextKey{}).(string); ok {
+		return v
+	}
+	return ""
+}
 
 // WithRequestedModelAlias stores the client-requested model name for usage sinks.
 func WithRequestedModelAlias(ctx context.Context, alias string) context.Context {
@@ -150,6 +224,67 @@ func ServiceTierFromContext(ctx context.Context) string {
 	default:
 		return DefaultServiceTier
 	}
+}
+
+// WithGenerate stores whether the client requested actual generation for usage sinks.
+// Missing context values default to true; only an explicit false disables generation.
+func WithGenerate(ctx context.Context, generate bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, generateContextKey{}, generate)
+}
+
+// GenerateFromContext returns whether the client requested actual generation.
+// Missing values default to true.
+func GenerateFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return true
+	}
+	raw := ctx.Value(generateContextKey{})
+	switch value := raw.(type) {
+	case bool:
+		return value
+	default:
+		return true
+	}
+}
+
+// WithStream stores whether the request was executed in streaming mode for usage sinks.
+func WithStream(ctx context.Context, stream bool) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, streamContextKey{}, stream)
+}
+
+// StreamFromContext returns whether the request was executed in streaming mode.
+// Missing values default to false.
+func StreamFromContext(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	raw := ctx.Value(streamContextKey{})
+	switch value := raw.(type) {
+	case bool:
+		return value
+	default:
+		return false
+	}
+}
+
+// GenerateFlag returns a pointer suitable for Record.Generate.
+func GenerateFlag(generate bool) *bool {
+	return &generate
+}
+
+// GenerateEnabled reports whether generation is enabled for the record field.
+// A nil value defaults to true so legacy callers that omit Generate keep the historical behavior.
+func GenerateEnabled(generate *bool) bool {
+	if generate == nil {
+		return true
+	}
+	return *generate
 }
 
 // Plugin consumes usage records emitted by the proxy runtime.
@@ -255,6 +390,20 @@ func (m *Manager) RegisterNamed(name string, plugin Plugin) {
 func (m *Manager) Publish(ctx context.Context, record Record) {
 	if m == nil {
 		return
+	}
+	if strings.TrimSpace(record.RequestID) == "" {
+		if reqID := ExecutionRequestIDFromContext(ctx); reqID != "" {
+			record.RequestID = reqID
+		} else {
+			record.RequestID = uuid.NewString()
+		}
+	}
+	if strings.TrimSpace(record.TraceID) == "" {
+		if trID := TraceIDFromContext(ctx); trID != "" {
+			record.TraceID = trID
+		} else if trID := internallogging.GetRequestID(ctx); trID != "" {
+			record.TraceID = trID
+		}
 	}
 	// ensure worker is running even if Start was not called explicitly
 	m.Start(context.Background())

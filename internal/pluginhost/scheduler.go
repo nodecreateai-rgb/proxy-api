@@ -4,7 +4,7 @@ import (
 	"context"
 	"strings"
 
-	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"github.com/router-for-me/CLIProxyAPI/v8/sdk/pluginapi"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -34,11 +34,19 @@ func (h *Host) HasScheduler() bool {
 	return h.schedulerRecord() != nil
 }
 
+func (h *Host) SchedulerWantsAcrossPriorities() bool {
+	record := h.schedulerRecord()
+	if record == nil {
+		return false
+	}
+	return schedulerWantsAcrossPriorities(record.plugin.Capabilities)
+}
+
 func (h *Host) schedulerRecord() *capabilityRecord {
 	if h == nil {
 		return nil
 	}
-	for _, record := range h.Snapshot().records {
+	for _, record := range h.activeRecords() {
 		if h.isPluginFused(record.id) || record.plugin.Capabilities.Scheduler == nil {
 			continue
 		}
@@ -50,7 +58,7 @@ func (h *Host) schedulerRecord() *capabilityRecord {
 
 func (h *Host) callScheduler(ctx context.Context, record capabilityRecord, req pluginapi.SchedulerPickRequest) (resp pluginapi.SchedulerPickResponse, handled bool, err error) {
 	scheduler := record.plugin.Capabilities.Scheduler
-	if h == nil || scheduler == nil || h.isPluginFused(record.id) {
+	if h == nil || scheduler == nil || h.isPluginFused(record.id) || !h.recordCurrent(record) {
 		return pluginapi.SchedulerPickResponse{}, false, nil
 	}
 	defer func() {
@@ -74,6 +82,18 @@ func (h *Host) callScheduler(ctx context.Context, record capabilityRecord, req p
 func normalizeSchedulerResponse(resp pluginapi.SchedulerPickResponse, req pluginapi.SchedulerPickRequest) (pluginapi.SchedulerPickResponse, bool, string) {
 	resp.AuthID = strings.TrimSpace(resp.AuthID)
 	resp.DelegateBuiltin = strings.TrimSpace(resp.DelegateBuiltin)
+	resp.RejectCode = strings.TrimSpace(resp.RejectCode)
+	resp.RejectReason = strings.TrimSpace(resp.RejectReason)
+
+	if resp.Reject {
+		if resp.RejectCode == "" {
+			resp.RejectCode = "auth_unavailable"
+		}
+		if resp.RejectReason == "" {
+			resp.RejectReason = "scheduler rejected candidate selection"
+		}
+		return resp, true, ""
+	}
 
 	hasAuthID := resp.AuthID != ""
 	hasDelegate := resp.DelegateBuiltin != ""

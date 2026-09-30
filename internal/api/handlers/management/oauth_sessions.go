@@ -9,11 +9,15 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	log "github.com/sirupsen/logrus"
 )
 
 const (
-	oauthSessionTTL     = 10 * time.Minute
-	maxOAuthStateLength = 128
+	// oauthSessionTTL must cover device-code flows (xAI ~30m, Kimi ~15m).
+	oauthSessionTTL          = 30 * time.Minute
+	oauthCompletedSessionTTL = time.Minute
+	maxOAuthStateLength      = 128
 )
 
 const (
@@ -33,23 +37,30 @@ type oauthSession struct {
 	Status    string
 	Source    string
 	Metadata  map[string]any
+	Completed bool
 	CreatedAt time.Time
 	ExpiresAt time.Time
 }
 
 type oauthSessionStore struct {
-	mu       sync.RWMutex
-	ttl      time.Duration
-	sessions map[string]oauthSession
+	mu           sync.RWMutex
+	ttl          time.Duration
+	completedTTL time.Duration
+	sessions     map[string]oauthSession
 }
 
 func newOAuthSessionStore(ttl time.Duration) *oauthSessionStore {
 	if ttl <= 0 {
 		ttl = oauthSessionTTL
 	}
+	completedTTL := oauthCompletedSessionTTL
+	if ttl < completedTTL {
+		completedTTL = ttl
+	}
 	return &oauthSessionStore{
-		ttl:      ttl,
-		sessions: make(map[string]oauthSession),
+		ttl:          ttl,
+		completedTTL: completedTTL,
+		sessions:     make(map[string]oauthSession),
 	}
 }
 
@@ -127,7 +138,7 @@ func (s *oauthSessionStore) SetError(state, message string) {
 
 	s.purgeExpiredLocked(now)
 	session, ok := s.sessions[state]
-	if !ok {
+	if !ok || session.Completed {
 		return
 	}
 	session.Status = message
@@ -146,7 +157,15 @@ func (s *oauthSessionStore) Complete(state string) {
 	defer s.mu.Unlock()
 
 	s.purgeExpiredLocked(now)
-	delete(s.sessions, state)
+	session, ok := s.sessions[state]
+	if !ok || session.Completed {
+		return
+	}
+	session.Status = ""
+	session.Metadata = nil
+	session.Completed = true
+	session.ExpiresAt = now.Add(s.completedTTL)
+	s.sessions[state] = session
 }
 
 func (s *oauthSessionStore) CompleteProvider(provider string, source string) int {
@@ -163,8 +182,12 @@ func (s *oauthSessionStore) CompleteProvider(provider string, source string) int
 	s.purgeExpiredLocked(now)
 	removed := 0
 	for state, session := range s.sessions {
-		if strings.EqualFold(session.Provider, provider) && (source == "" || session.Source == source) {
-			delete(s.sessions, state)
+		if !session.Completed && strings.EqualFold(session.Provider, provider) && (source == "" || session.Source == source) {
+			session.Status = ""
+			session.Metadata = nil
+			session.Completed = true
+			session.ExpiresAt = now.Add(s.completedTTL)
+			s.sessions[state] = session
 			removed++
 		}
 	}
@@ -197,13 +220,34 @@ func (s *oauthSessionStore) IsPending(state, provider string) bool {
 	if !ok {
 		return false
 	}
-	if session.Status != "" {
+	if session.Completed || session.Status != "" {
 		return false
 	}
 	if provider == "" {
 		return true
 	}
 	return strings.EqualFold(session.Provider, provider)
+}
+
+// Cancel removes a pending OAuth session so background waiters exit without saving credentials.
+// Returns true when a pending session was cancelled.
+func (s *oauthSessionStore) Cancel(state string) bool {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return false
+	}
+	now := time.Now()
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.purgeExpiredLocked(now)
+	session, ok := s.sessions[state]
+	if !ok || session.Completed || session.Status != "" {
+		return false
+	}
+	delete(s.sessions, state)
+	return true
 }
 
 func cloneOAuthSessionMetadata(in map[string]any) map[string]any {
@@ -239,22 +283,39 @@ func CompletePluginOAuthSessionsByProvider(provider string) int {
 
 func GetOAuthSession(state string) (provider string, status string, ok bool) {
 	session, ok := oauthSessions.Get(state)
-	if !ok {
+	if !ok || session.Completed {
 		return "", "", false
 	}
 	return session.Provider, session.Status, true
 }
 
-func GetOAuthSessionDetails(state string) (provider string, status string, isPlugin bool, metadata map[string]any, ok bool) {
+func GetOAuthSessionDetails(state string) (provider string, status string, isPlugin bool, metadata map[string]any, completed bool, ok bool) {
 	session, ok := oauthSessions.Get(state)
 	if !ok {
-		return "", "", false, nil, false
+		return "", "", false, nil, false, false
 	}
-	return session.Provider, session.Status, session.Source == oauthSessionSourcePlugin, cloneOAuthSessionMetadata(session.Metadata), true
+	return session.Provider, session.Status, session.Source == oauthSessionSourcePlugin, cloneOAuthSessionMetadata(session.Metadata), session.Completed, true
 }
 
 func IsOAuthSessionPending(state, provider string) bool {
 	return oauthSessions.IsPending(state, provider)
+}
+
+// guardOAuthSessionPendingForSave returns errOAuthSessionNotPending when the session
+// is no longer pending (cancelled, completed, errored, or expired).
+// Call immediately before persisting credentials so a cancel that races with token
+// exchange or metadata fetch cannot save credentials for a cancelled flow.
+func guardOAuthSessionPendingForSave(state, provider string) error {
+	if IsOAuthSessionPending(state, provider) {
+		return nil
+	}
+	return errOAuthSessionNotPending
+}
+
+// CancelOAuthSession cancels a pending OAuth session by state.
+// Background callback and device-code waiters observe IsOAuthSessionPending as false and exit without saving credentials.
+func CancelOAuthSession(state string) bool {
+	return oauthSessions.Cancel(state)
 }
 
 func oauthSessionErrorWithCause(message string, cause error) string {
@@ -309,6 +370,10 @@ func NormalizeOAuthProvider(provider string) (string, error) {
 		return "antigravity", nil
 	case "xai", "x-ai", "x.ai", "grok":
 		return "xai", nil
+	case "devin", "cognition":
+		return "devin", nil
+	case "meta", "muse":
+		return "meta", nil
 	default:
 		return "", errUnsupportedOAuthFlow
 	}
@@ -386,8 +451,27 @@ func writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessag
 	if err != nil {
 		return "", fmt.Errorf("marshal oauth callback payload: %w", err)
 	}
-	if err := os.WriteFile(filePath, data, 0o600); err != nil {
-		return "", fmt.Errorf("write oauth callback file: %w", err)
+	// Publish complete JSON atomically so background waiters cannot read a partial callback.
+	tmp, errCreate := os.CreateTemp(authDir, ".oauth-callback-*")
+	if errCreate != nil {
+		return "", fmt.Errorf("create oauth callback file: %w", errCreate)
+	}
+	tmpPath := tmp.Name()
+	defer func() {
+		if errRemove := os.Remove(tmpPath); errRemove != nil && !errors.Is(errRemove, os.ErrNotExist) {
+			log.Warn("failed to remove temporary OAuth callback file")
+		}
+	}()
+	_, errWrite := tmp.Write(data)
+	errClose := tmp.Close()
+	if errWrite != nil {
+		return "", fmt.Errorf("write oauth callback file: %w", errWrite)
+	}
+	if errClose != nil {
+		return "", fmt.Errorf("close oauth callback file: %w", errClose)
+	}
+	if errRename := os.Rename(tmpPath, filePath); errRename != nil {
+		return "", fmt.Errorf("publish oauth callback file: %w", errRename)
 	}
 	return filePath, nil
 }

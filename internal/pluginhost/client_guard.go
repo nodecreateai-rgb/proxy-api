@@ -7,17 +7,40 @@ import (
 )
 
 type guardedPluginClient struct {
-	mu     sync.Mutex
-	cond   *sync.Cond
-	inner  pluginClient
-	calls  int
-	closed bool
+	mu           sync.Mutex
+	cond         *sync.Cond
+	inner        pluginClient
+	instance     *hostCallbackInstance
+	calls        int
+	closed       bool
+	shutdownDone chan struct{}
 }
 
-func newGuardedPluginClient(inner pluginClient) pluginClient {
-	client := &guardedPluginClient{inner: inner}
+func newGuardedPluginClient(inner pluginClient) *guardedPluginClient {
+	instance := pluginCallbackInstance(inner)
+	if instance == nil {
+		instance = &hostCallbackInstance{}
+	}
+	client := &guardedPluginClient{inner: inner, instance: instance, shutdownDone: make(chan struct{})}
 	client.cond = sync.NewCond(&client.mu)
 	return client
+}
+
+func (c *guardedPluginClient) callbackInstance() *hostCallbackInstance {
+	if c == nil {
+		return nil
+	}
+	return c.instance
+}
+
+func pluginCallbackInstance(client pluginClient) *hostCallbackInstance {
+	if client == nil {
+		return nil
+	}
+	if provider, ok := client.(interface{ callbackInstance() *hostCallbackInstance }); ok {
+		return provider.callbackInstance()
+	}
+	return nil
 }
 
 func (c *guardedPluginClient) Call(ctx context.Context, method string, request []byte) ([]byte, error) {
@@ -25,8 +48,35 @@ func (c *guardedPluginClient) Call(ctx context.Context, method string, request [
 	if errAcquire != nil {
 		return nil, errAcquire
 	}
-	defer c.release()
-	return inner.Call(ctx, method, request)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	result := make(chan guardedPluginCallResult, 1)
+	go func() {
+		defer c.release()
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				result <- guardedPluginCallResult{recovered: recovered}
+			}
+		}()
+		response, errCall := inner.Call(ctx, method, request)
+		result <- guardedPluginCallResult{response: response, err: errCall}
+	}()
+	select {
+	case callResult := <-result:
+		if callResult.recovered != nil {
+			panic(callResult.recovered)
+		}
+		return callResult.response, callResult.err
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+type guardedPluginCallResult struct {
+	response  []byte
+	err       error
+	recovered any
 }
 
 func (c *guardedPluginClient) acquire() (pluginClient, error) {
@@ -52,28 +102,49 @@ func (c *guardedPluginClient) release() {
 }
 
 func (c *guardedPluginClient) Shutdown() {
+	c.ShutdownContext(context.Background())
+}
+
+// ShutdownContext detaches the client immediately and waits for active calls only
+// until ctx is canceled. Detached cleanup continues asynchronously when needed.
+func (c *guardedPluginClient) ShutdownContext(ctx context.Context) {
 	if c == nil {
 		return
 	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
-	var inner pluginClient
 	c.mu.Lock()
 	if c.closed {
+		done := c.shutdownDone
+		c.mu.Unlock()
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+		return
+	}
+	c.closed = true
+	inner := c.inner
+	c.inner = nil
+	done := c.shutdownDone
+	c.mu.Unlock()
+
+	go func() {
+		c.mu.Lock()
 		for c.calls > 0 {
 			c.cond.Wait()
 		}
 		c.mu.Unlock()
-		return
-	}
-	c.closed = true
-	for c.calls > 0 {
-		c.cond.Wait()
-	}
-	inner = c.inner
-	c.inner = nil
-	c.mu.Unlock()
+		if inner != nil {
+			inner.Shutdown()
+		}
+		close(done)
+	}()
 
-	if inner != nil {
-		inner.Shutdown()
+	select {
+	case <-done:
+	case <-ctx.Done():
 	}
 }

@@ -1,8 +1,13 @@
 package auth
 
 import (
+	"bytes"
+
+	"github.com/tidwall/gjson"
 	"strings"
 	"testing"
+
+	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/executor"
 )
 
 func TestStreamRewriter_RewriteChunk_KimiMessagesDataPrefixWithoutSpace(t *testing.T) {
@@ -179,5 +184,152 @@ func TestRewriteSSEPayloadLines_CodexResponsesLiveFrame(t *testing.T) {
 	}
 	if strings.Contains(got, `"model":"gpt-5.4"`) {
 		t.Fatalf("rewritten chunk still contains upstream model: %q", got)
+	}
+}
+
+func TestRewriteForceMappedResponse_NoRewriteWhenForceMappingDisabled(t *testing.T) {
+	upstream := []byte(`{"model":"gpt-5.4","choices":[]}`)
+	resp := &cliproxyexecutor.Response{Payload: append([]byte(nil), upstream...)}
+	rewriteForceMappedResponse(resp, OAuthModelAliasResult{
+		UpstreamModel: "gpt-5.4",
+		ForceMapping:  false,
+		OriginalAlias: "gpt-5.4-fast",
+	})
+	if string(resp.Payload) != string(upstream) {
+		t.Fatalf("payload = %s, want unchanged %s", resp.Payload, upstream)
+	}
+}
+
+func TestRewriteForceMappedStreamChunk_NoRewriteWhenRewriterNil(t *testing.T) {
+	chunk := []byte(`data: {"model":"gpt-5.4"}` + "\n\n")
+	got := rewriteForceMappedStreamChunk(nil, chunk)
+	if string(got) != string(chunk) {
+		t.Fatalf("chunk = %q, want unchanged upstream payload", got)
+	}
+}
+
+func TestNormalizeGluedSSEEvents_SplitsValidGlueOnly(t *testing.T) {
+	glued := []byte("event: response.created\ndata: {\"type\":\"response.created\"}event: response.completed\ndata: {\"type\":\"response.completed\"}")
+	got := normalizeGluedSSEEvents(glued)
+	if !bytes.Contains(got, []byte("}\n\nevent:")) {
+		t.Fatalf("expected glued frame split, got %q", got)
+	}
+
+	inside := []byte("event: response.output_text.delta\ndata: {\"type\":\"delta\",\"text\":\"literal }event: inside string\"}")
+	gotInside := string(normalizeGluedSSEEvents(inside))
+	if strings.Contains(gotInside, "}\n\nevent:") {
+		t.Fatalf("should not split inside JSON string, got %q", gotInside)
+	}
+	for _, line := range bytes.Split(inside, []byte("\n")) {
+		if bytes.HasPrefix(line, []byte("data:")) {
+			_, jd, ok := extractSSEDataLine(line)
+			if !ok || !gjson.ValidBytes(jd) {
+				t.Fatalf("baseline invalid")
+			}
+		}
+	}
+	for _, line := range bytes.Split([]byte(gotInside), []byte("\n")) {
+		if bytes.HasPrefix(line, []byte("data:")) {
+			_, jd, ok := extractSSEDataLine(line)
+			if !ok || !gjson.ValidBytes(jd) {
+				t.Fatalf("corrupted JSON after normalize: %q", gotInside)
+			}
+		}
+	}
+}
+
+func TestNormalizeGluedSSEEvents_SplitsCodexDataGlueOnly(t *testing.T) {
+	glued := []byte(`data: {"type":"response.created"}data: {"type":"response.completed"}`)
+	got := normalizeGluedSSEEvents(glued)
+	if !bytes.Contains(got, []byte("}\ndata:")) {
+		t.Fatalf("expected codex glued split, got %q", got)
+	}
+	inside := []byte(`data: {"type":"delta","text":"literal }data: inside"}`)
+	gotInside := string(normalizeGluedSSEEvents(inside))
+	if strings.Contains(gotInside, "}\ndata:") && !bytes.Equal([]byte(gotInside), inside) {
+		// Only fail if we actually inserted a split (unchanged is OK)
+		for _, line := range bytes.Split([]byte(gotInside), []byte("\n")) {
+			if bytes.HasPrefix(line, []byte("data:")) {
+				_, jd, ok := extractSSEDataLine(line)
+				if !ok || !gjson.ValidBytes(jd) {
+					t.Fatalf("corrupted JSON: %q", gotInside)
+				}
+			}
+		}
+	}
+}
+
+func parseResponsesWSDataEventTypes(payload []byte) []string {
+	lines := bytes.Split(payload, []byte("\n"))
+	var types []string
+	for _, line := range lines {
+		line = bytes.TrimSpace(line)
+		if len(line) == 0 || bytes.HasPrefix(line, []byte("event:")) {
+			continue
+		}
+		if bytes.HasPrefix(line, []byte("data:")) {
+			line = bytes.TrimSpace(line[len("data:"):])
+		}
+		if len(line) == 0 || !gjson.ValidBytes(line) {
+			continue
+		}
+		types = append(types, gjson.GetBytes(line, "type").String())
+	}
+	return types
+}
+
+func TestRewriteForceMappedStreamChunk_CodexDataLinesWithoutNewlines_FinishParsesCompleted(t *testing.T) {
+	rewriter := NewStreamRewriter(StreamRewriteOptions{RewriteModel: "gpt-5.4-fast"})
+	lines := [][]byte{
+		[]byte(`data: {"type":"response.created","response":{"model":"gpt-5.4"}}`),
+		[]byte(`data: {"type":"response.in_progress","response":{"model":"gpt-5.4"}}`),
+		[]byte(`data: {"type":"response.completed","response":{"model":"gpt-5.4","output":[]}}`),
+	}
+	var types []string
+	for _, ln := range lines {
+		if out := rewriteForceMappedStreamChunk(rewriter, ln); len(out) > 0 {
+			types = append(types, parseResponsesWSDataEventTypes(out)...)
+		}
+	}
+	if tail := finishForceMappedStreamChunks(rewriter); len(tail) > 0 {
+		types = append(types, parseResponsesWSDataEventTypes(tail)...)
+	}
+	found := false
+	for _, typ := range types {
+		if typ == "response.completed" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("missing response.completed; types=%v", types)
+	}
+}
+
+func TestStreamRewriter_LoggedOnceAndRewrittenChunksCount(t *testing.T) {
+	rewriter := NewStreamRewriter(StreamRewriteOptions{RewriteModel: "gemini-3.8-flash"})
+	chunks := [][]byte{
+		[]byte("data: {\"modelVersion\":\"gemini-3.8-flash-high\",\"text\":\"part 1\"}\n\n"),
+		[]byte("data: {\"modelVersion\":\"gemini-3.8-flash-high\",\"text\":\"part 2\"}\n\n"),
+		[]byte("data: {\"modelVersion\":\"gemini-3.8-flash-high\",\"text\":\"part 3\"}\n\n"),
+		[]byte("data: [DONE]\n\n"),
+	}
+
+	for _, c := range chunks {
+		out := rewriter.RewriteChunk(c)
+		if len(out) == 0 {
+			t.Fatalf("unexpected empty chunk output")
+		}
+	}
+	finishForceMappedStreamChunks(rewriter)
+
+	if rewriter.rewrittenChunks != 3 {
+		t.Fatalf("expected 3 rewritten chunks, got %d", rewriter.rewrittenChunks)
+	}
+	if !rewriter.loggedPaths["modelVersion"] {
+		t.Fatalf("expected modelVersion to be tracked in loggedPaths")
+	}
+	if !rewriter.loggedFinished {
+		t.Fatalf("expected loggedFinished to be true after [DONE] and finish")
 	}
 }
